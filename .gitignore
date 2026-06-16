@@ -1,0 +1,11 @@
+node_modules
+.vite
+dist
+src-tauri/target
+src-tauri/gen
+*.log
+.DS_Store
+doc/远眺 Gaze20 — 护眼提醒软件.md
+doc/design/
+远眺 Gaze20.html
+.gstack/
