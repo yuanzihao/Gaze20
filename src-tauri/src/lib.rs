@@ -541,6 +541,33 @@ fn upsert_daily<R: Runtime>(app: &AppHandle<R>, e: &engine::Engine) {
     }
 }
 
+/// Best-effort flush of live state to disk: the engine snapshot plus today's
+/// aggregate. Called on a clean quit so the last few seconds aren't lost.
+fn flush_state<R: Runtime>(app: &AppHandle<R>) {
+    persist_engine(app);
+    if let Some(eh) = app.try_state::<EngineHandle>() {
+        let snapshot = eh.engine.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        upsert_daily(app, &snapshot);
+    }
+}
+
+/// Whole-day difference `to - from` (both `YYYY-MM-DD`), via SQLite date math.
+/// Returns 1 (the "consecutive" default) if the database is unavailable.
+fn days_between<R: Runtime>(app: &AppHandle<R>, from: &str, to: &str) -> i64 {
+    if let Some(db) = app.try_state::<db::Database>() {
+        if let Ok(conn) = db.conn.lock() {
+            if let Ok(diff) = conn.query_row(
+                "SELECT CAST(round(julianday(?2) - julianday(?1)) AS INTEGER)",
+                rusqlite::params![from, to],
+                |row| row.get::<_, i64>(0),
+            ) {
+                return diff;
+            }
+        }
+    }
+    1
+}
+
 fn load_engine<R: Runtime>(app: &AppHandle<R>) -> engine::Engine {
     let mut e = engine::Engine::default();
     if let Some(db) = app.try_state::<db::Database>() {
@@ -684,9 +711,19 @@ fn spawn_engine_loop<R: Runtime + 'static>(app: AppHandle<R>) {
                 None => continue,
             };
 
-            // Finalize the finished day's aggregate at the boundary.
+            // Finalize the finished day's aggregate at the boundary, then advance the
+            // consecutive-guard streak based on how that day went.
             if let Some(finished_day) = finished {
                 upsert_daily(&app, &finished_day);
+                let consecutive = days_between(&app, &finished_day.date, &today) == 1;
+                let qualified =
+                    engine::day_qualifies(finished_day.micro_done, finished_day.screen_seconds);
+                let new_streak =
+                    engine::next_streak(finished_day.streak_days, qualified, consecutive);
+                if let Some(eh) = app.try_state::<EngineHandle>() {
+                    eh.engine.lock().unwrap_or_else(|p| p.into_inner()).streak_days = new_streak;
+                }
+                persist_engine(&app);
             }
 
             // Bump the per-hour heatmap bucket for the seconds actually accrued.
@@ -712,7 +749,7 @@ fn spawn_engine_loop<R: Runtime + 'static>(app: AppHandle<R>) {
             }
 
             let _ = app.emit("engine-state", &live);
-            if ticks % 5 == 0 {
+            if ticks.is_multiple_of(5) {
                 persist_engine(&app);
                 if let Some(eh) = app.try_state::<EngineHandle>() {
                     let snapshot_engine = eh.engine.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -920,6 +957,7 @@ fn non_empty(s: &str) -> Option<&str> {
 /// the JSON first, imports logs/symptoms as facts and the legacy "today" as a
 /// daily_stats row, and (only on a fresh install) seeds the engine settings.
 /// Guarded by `app_meta`-style `legacy_imported` so it never runs twice.
+#[allow(clippy::field_reassign_with_default)]
 fn import_legacy_json<R: Runtime>(app: &AppHandle<R>) {
     let db = match app.try_state::<db::Database>() {
         Some(db) => db,
@@ -1103,12 +1141,12 @@ pub fn run() {
 
             // One-time import of the legacy gaze20-data.json (before the engine
             // loads, so a fresh install can seed engine settings from it).
-            import_legacy_json(&app.handle());
+            import_legacy_json(app.handle());
 
             // Rust now owns the state machine: load the persisted engine (resumes
             // mid-day), start the 1s authority loop, and resolve native-overlay
             // button/timeout actions into the engine + the reminder_events log.
-            let engine_state = load_engine(&app.handle());
+            let engine_state = load_engine(app.handle());
             app.manage(EngineHandle {
                 engine: std::sync::Mutex::new(engine_state),
                 snapshot: std::sync::Mutex::new(fallback_snapshot()),
@@ -1143,7 +1181,10 @@ pub fn run() {
                     "resume" => {
                         let _ = app.emit("tray-action", "resume");
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        flush_state(app);
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {

@@ -8,4 +8,7 @@ src-tauri/gen
 doc/远眺 Gaze20 — 护眼提醒软件.md
 doc/design/
 远眺 Gaze20.html
+# Original full-size eye masters (~15MB); the app ships the optimized public/eyes/*.webp.
+# Kept locally for re-optimizing via scripts/optimize_eyes.py, but out of version control.
+eyes-redness-score-image/
 .gstack/

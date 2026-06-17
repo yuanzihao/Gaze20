@@ -668,7 +668,7 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("backup.db"));
     }
 
-    fn agg(date: &str, risk: i64) -> DailyAgg {
+    fn agg(date: &str, risk: i64) -> DailyAgg<'_> {
         DailyAgg {
             date,
             screen_seconds: 100.0,

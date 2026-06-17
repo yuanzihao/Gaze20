@@ -1,5 +1,9 @@
 // Native GDI reminder windows. These do not depend on the main WebView, so they
 // still appear when Gaze20 is minimized to the tray.
+//
+// Kept as an inactive fallback renderer (the live overlay is the WebView card), so
+// clippy's Send/Sync-Arc lint here is allowed rather than reworking dead code.
+#![allow(clippy::arc_with_non_send_sync)]
 
 use std::ffi::c_void;
 use std::sync::mpsc;

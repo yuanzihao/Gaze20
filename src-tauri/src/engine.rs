@@ -260,10 +260,7 @@ impl Engine {
     /// the gaze-seconds credited (so the host can write the `reminder_events` row),
     /// or `None` if no reminder was active (idempotent against duplicate actions).
     pub fn resolve(&mut self, result: Reminder, now_ms: u128) -> Option<(Kind, f64)> {
-        let kind = match self.reminding {
-            Some(k) => k,
-            None => return None,
-        };
+        let kind = self.reminding?;
         let preset = self.mode.preset();
         let mut gaze_credit = 0.0;
         match result {
@@ -321,6 +318,27 @@ impl Engine {
         self.streak_days = keep_streak;
         self.date = today.to_string();
         finished
+    }
+}
+
+/// A finished day counts toward the consecutive-guard streak only if the user
+/// actually used the screen meaningfully and took at least one micro-break.
+pub const STREAK_MIN_MICRO_DONE: i64 = 1;
+pub const STREAK_MIN_SCREEN_SECONDS: f64 = 20.0 * SECS_PER_MIN;
+
+/// Whether a finished day's counters meet the streak guard threshold.
+pub fn day_qualifies(micro_done: i64, screen_seconds: f64) -> bool {
+    micro_done >= STREAK_MIN_MICRO_DONE && screen_seconds >= STREAK_MIN_SCREEN_SECONDS
+}
+
+/// The streak value for the new day. A qualified day that is exactly the day after
+/// the finished one extends the streak; a missed day or a multi-day gap restarts it
+/// at 1 (today is the first day of a fresh chain).
+pub fn next_streak(finished_streak: i64, qualified: bool, consecutive: bool) -> i64 {
+    if qualified && consecutive {
+        finished_streak.max(0) + 1
+    } else {
+        1
     }
 }
 
@@ -438,5 +456,15 @@ mod tests {
         assert_eq!(e.date, "2026-06-17");
         assert_eq!(e.mode, Mode::Intense); // settings preserved
         assert_eq!(e.streak_days, 7);
+    }
+
+    #[test]
+    fn streak_extends_then_resets() {
+        assert!(day_qualifies(1, STREAK_MIN_SCREEN_SECONDS));
+        assert!(!day_qualifies(0, STREAK_MIN_SCREEN_SECONDS)); // no micro-break taken
+        assert!(!day_qualifies(1, 60.0)); // too little screen time
+        assert_eq!(next_streak(3, true, true), 4); // qualified + consecutive → +1
+        assert_eq!(next_streak(3, false, true), 1); // missed the guard → reset
+        assert_eq!(next_streak(3, true, false), 1); // a gap broke the chain → reset
     }
 }
