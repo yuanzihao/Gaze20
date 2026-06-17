@@ -921,8 +921,8 @@ function Overview(props: {
       window.clearInterval(handle);
     };
   }, []);
-  // Timeline geometry: a bar at full height means the whole hour was eye-use.
-  const BAR_MAX = 46;
+  // Timeline geometry: each hour is a fixed-height slot; a full fill = the whole hour.
+  const SLOT_H = 56;
 
   // This week's guard status from real daily_stats (refreshed periodically).
   const [dailyDone, setDailyDone] = useState<Record<string, boolean>>({});
@@ -1052,37 +1052,43 @@ function Overview(props: {
         <div style={{ ...dzCard, padding: "20px 22px" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 15, fontWeight: 700, color: "#1d3a32" }}>今日时间轴</div>
-            <div style={{ fontSize: 11.5, color: "#9aada5", fontWeight: 600 }}>柱高 = 该小时用眼时长 · 点/块 = 完成的休息</div>
+            <div style={{ fontSize: 11.5, color: "#9aada5", fontWeight: 600 }}>柱高 = 该小时用眼时长 · 横杆 = 当时的微/深休息</div>
           </div>
-          <div style={{ display: "flex", justifyContent: "space-between", fontFamily: "'Manrope'", fontSize: 11, color: "#9aada5", margin: "14px 4px 5px", fontWeight: 600 }}>
-            {["00", "03", "06", "09", "12", "15", "18", "21", "24"].map((h) => <span key={h}>{h}</span>)}
-          </div>
-          <div style={{ position: "relative", height: 76, background: "#eef5f1", borderRadius: 10, padding: "0 6px", display: "flex", alignItems: "flex-end", gap: 2 }}>
-            <div style={{ position: "absolute", left: 8, right: 8, bottom: 8 + BAR_MAX / 2, borderTop: "1px dashed #c2d6cd", pointerEvents: "none" }} />
-            <span style={{ position: "absolute", right: 9, bottom: 8 + BAR_MAX / 2 + 2, fontSize: 9.5, color: "#a7bbb2", fontFamily: "'Manrope'", fontWeight: 600 }}>30 分</span>
+          <div style={{ position: "relative", height: SLOT_H, display: "flex", gap: 3, padding: "0 8px", marginTop: 14 }}>
+            <div style={{ position: "absolute", left: 8, right: 8, top: SLOT_H / 2, borderTop: "1px dashed #c2d6cd", pointerEvents: "none", zIndex: 2 }} />
+            <span style={{ position: "absolute", right: 9, top: SLOT_H / 2 - 13, fontSize: 9.5, color: "#a7bbb2", fontFamily: "'Manrope'", fontWeight: 600 }}>30 分</span>
             {hourly.map((sec, h) => {
               const frac = clamp(sec / 3600, 0, 1);
               const active = sec > 1;
-              const barH = active ? Math.max(5, Math.round(frac * BAR_MAX)) : 0;
+              const fillH = active ? Math.max(3, Math.round(frac * SLOT_H)) : 0;
               const minutes = Math.round(sec / 60);
+              const deeps = Math.min(deepByHour[h], 5);
+              const micros = Math.min(microByHour[h], 5);
               const tip = `${String(h).padStart(2, "0")}:00 · 用眼 ${minutes} 分钟` +
                 (microByHour[h] ? ` · 微休息 ${microByHour[h]} 次` : "") +
                 (deepByHour[h] ? ` · 深休息 ${deepByHour[h]} 次` : "");
               return (
-                <div key={h} title={tip} style={{ position: "relative", flex: 1, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", paddingBottom: 8 }}>
-                  <div style={{ position: "absolute", top: 4, display: "flex", gap: 2, alignItems: "center" }}>
-                    {deepByHour[h] > 0 && <span style={{ width: 6, height: 6, background: "#7b8ff0", borderRadius: 2 }} />}
-                    {microByHour[h] > 0 && <span style={{ width: 6, height: 6, background: "#2f9e80", borderRadius: "50%" }} />}
-                  </div>
-                  <div style={{ width: "100%", maxWidth: 13, height: barH, borderRadius: 3, background: active ? timelineBarColor(frac) : "transparent", boxShadow: active ? "inset 0 1px 0 rgba(255,255,255,.3)" : "none" }} />
+                <div key={h} title={tip} style={{ position: "relative", flex: 1, height: "100%", background: "#e6efeb", borderRadius: 4, overflow: "hidden" }}>
+                  <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: fillH, background: active ? timelineBarColor(frac) : "transparent", zIndex: 1 }} />
+                  {Array.from({ length: deeps }).map((_, k) => (
+                    <div key={"d" + k} style={{ position: "absolute", left: 2, right: 2, top: 4 + k * 5, height: 3, borderRadius: 1.5, background: "#7b8ff0", boxShadow: "0 0 0 1px rgba(255,255,255,.8)", zIndex: 3 }} />
+                  ))}
+                  {Array.from({ length: micros }).map((_, k) => (
+                    <div key={"m" + k} style={{ position: "absolute", left: 2, right: 2, top: 4 + (deeps + k) * 5, height: 3, borderRadius: 1.5, background: "#34cda6", boxShadow: "0 0 0 1px rgba(255,255,255,.8)", zIndex: 3 }} />
+                  ))}
                 </div>
               );
             })}
           </div>
+          <div style={{ display: "flex", gap: 3, padding: "0 8px", marginTop: 6, fontFamily: "'Manrope'", fontSize: 10, color: "#9aada5", fontWeight: 600 }}>
+            {Array.from({ length: 24 }).map((_, h) => (
+              <span key={h} style={{ flex: 1, textAlign: "center" }}>{h % 3 === 0 ? String(h).padStart(2, "0") : ""}</span>
+            ))}
+          </div>
           <div style={{ display: "flex", alignItems: "center", gap: 16, marginTop: 13, fontSize: 12.5, color: "#6f857c", fontWeight: 600, flexWrap: "wrap" }}>
             <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 10, height: 10, borderRadius: 3, background: "linear-gradient(180deg,#8fd5b8,#1f7a64)" }} />用眼（满格 60 分）</span>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: "#2f9e80" }} />微休息 {props.data.today.microDone} 次</span>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 8, height: 8, borderRadius: 2, background: "#7b8ff0" }} />深休息 {props.data.today.deepDone} 次</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3, borderRadius: 1.5, background: "#34cda6" }} />微休息 {props.data.today.microDone} 次</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3, borderRadius: 1.5, background: "#7b8ff0" }} />深休息 {props.data.today.deepDone} 次</span>
             <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, background: "#1d3a32", color: "#fff", fontFamily: "'Manrope'", fontWeight: 700, fontSize: 12, padding: "5px 11px", borderRadius: 8 }}>现在 {nowLabel}</span>
           </div>
         </div>
