@@ -861,6 +861,15 @@ function TopBar(props: {
   );
 }
 
+function timelineBarColor(frac: number): string {
+  // Light teal → deep green: a high-contrast ramp so low hours stay readable.
+  const lo = [143, 213, 184];
+  const hi = [31, 122, 100];
+  const t = clamp(frac, 0, 1);
+  const c = lo.map((l, i) => Math.round(l + (hi[i] - l) * t));
+  return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
+}
+
 function Overview(props: {
   data: PersistedData;
   snapshot: ActivitySnapshot;
@@ -912,7 +921,50 @@ function Overview(props: {
       window.clearInterval(handle);
     };
   }, []);
-  const maxHourSeconds = Math.max(300, ...hourly);
+  // Timeline geometry: a bar at full height means the whole hour was eye-use.
+  const BAR_MAX = 46;
+
+  // This week's guard status from real daily_stats (refreshed periodically).
+  const [dailyDone, setDailyDone] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      const rows = await safeInvoke<DbDailyRow[]>("db_daily_stats", { limit: 21 });
+      if (!active) return;
+      const map: Record<string, boolean> = {};
+      for (const r of rows ?? []) map[r.date] = r.microDone >= 1 && r.screenSeconds >= 1200;
+      setDailyDone(map);
+    };
+    load();
+    const handle = window.setInterval(load, 60000);
+    return () => {
+      active = false;
+      window.clearInterval(handle);
+    };
+  }, []);
+
+  // Per-hour completed micro/deep breaks today → timeline markers.
+  const todayIso = localIsoDate(new Date());
+  const microByHour = Array<number>(24).fill(0);
+  const deepByHour = Array<number>(24).fill(0);
+  for (const log of props.data.logs) {
+    if (log.result !== "completed" || !log.at || log.at.slice(0, 10) !== todayIso) continue;
+    const h = parseInt(log.at.slice(11, 13), 10);
+    if (h >= 0 && h < 24) (log.kind === "deep" ? deepByHour : microByHour)[h] += 1;
+  }
+
+  // Mon–Sun cells: done / miss (past + live today) / future (not yet reached).
+  const todayQualified = props.data.today.microDone >= 1 && props.data.today.screenSeconds >= 1200;
+  const weekMonday = new Date();
+  weekMonday.setDate(weekMonday.getDate() - ((weekMonday.getDay() + 6) % 7));
+  const weekCells = ["一", "二", "三", "四", "五", "六", "日"].map((label, i) => {
+    const d = new Date(weekMonday);
+    d.setDate(weekMonday.getDate() + i);
+    const iso = localIsoDate(d);
+    const state: "done" | "miss" | "future" =
+      iso > todayIso ? "future" : iso === todayIso ? (todayQualified ? "done" : "miss") : dailyDone[iso] ? "done" : "miss";
+    return { label, state };
+  });
 
   const suggestions = [
     { title: "看向 6 米外 20 秒", sub: "放松睫状肌，缓解视觉疲劳", bg: "#e6f6ee", color: "#2caa7e", icon: <><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z" /><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" /></> },
@@ -999,43 +1051,38 @@ function Overview(props: {
 
         <div style={{ ...dzCard, padding: "20px 22px" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 15, fontWeight: 700, color: "#1d3a32" }}>今日时间轴 <span style={{ color: "#b3c4bc", fontSize: 13 }}>ⓘ</span></div>
-            <div style={{ display: "flex", gap: 16, fontSize: 12, color: "#6f857c", fontWeight: 600 }}>
-              <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: "#3aa78c" }} />专注工作</span>
-              <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: "#9fdcc6" }} />微休息</span>
-              <span style={{ display: "flex", alignItems: "center", gap: 5 }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7b8ff0" }} />深休息</span>
-            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 15, fontWeight: 700, color: "#1d3a32" }}>今日时间轴</div>
+            <div style={{ fontSize: 11.5, color: "#9aada5", fontWeight: 600 }}>柱高 = 该小时用眼时长 · 点/块 = 完成的休息</div>
           </div>
-          <div style={{ display: "flex", justifyContent: "space-between", fontFamily: "'Manrope'", fontSize: 11, color: "#9aada5", margin: "16px 2px 6px", fontWeight: 600 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontFamily: "'Manrope'", fontSize: 11, color: "#9aada5", margin: "14px 4px 5px", fontWeight: 600 }}>
             {["00", "03", "06", "09", "12", "15", "18", "21", "24"].map((h) => <span key={h}>{h}</span>)}
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-            <span style={{ fontSize: 11, color: "#9aada5", fontWeight: 600, flex: "none" }}>0 时</span>
-            <div style={{ flex: 1, display: "flex", alignItems: "flex-end", gap: 2, height: 30, background: "#f6faf8", borderRadius: 8, padding: "0 6px" }}>
-              {hourly.map((sec, h) => {
-                const intensity = clamp(sec / maxHourSeconds, 0, 1);
-                const active = sec > 1;
-                return (
-                  <div
-                    key={h}
-                    title={`${String(h).padStart(2, "0")}:00 · ${formatDuration(sec, true)}`}
-                    style={{
-                      flex: 1,
-                      borderRadius: 3,
-                      background: active ? "#3aa78c" : "#eaf1ee",
-                      opacity: active ? 0.45 + intensity * 0.55 : 1,
-                      height: active ? Math.max(8, Math.round(8 + intensity * 18)) : 6
-                    }}
-                  />
-                );
-              })}
-            </div>
-            <span style={{ fontSize: 11, color: "#9aada5", fontWeight: 600, flex: "none" }}>24 时</span>
+          <div style={{ position: "relative", height: 76, background: "#eef5f1", borderRadius: 10, padding: "0 6px", display: "flex", alignItems: "flex-end", gap: 2 }}>
+            <div style={{ position: "absolute", left: 8, right: 8, bottom: 8 + BAR_MAX / 2, borderTop: "1px dashed #c2d6cd", pointerEvents: "none" }} />
+            <span style={{ position: "absolute", right: 9, bottom: 8 + BAR_MAX / 2 + 2, fontSize: 9.5, color: "#a7bbb2", fontFamily: "'Manrope'", fontWeight: 600 }}>30 分</span>
+            {hourly.map((sec, h) => {
+              const frac = clamp(sec / 3600, 0, 1);
+              const active = sec > 1;
+              const barH = active ? Math.max(5, Math.round(frac * BAR_MAX)) : 0;
+              const minutes = Math.round(sec / 60);
+              const tip = `${String(h).padStart(2, "0")}:00 · 用眼 ${minutes} 分钟` +
+                (microByHour[h] ? ` · 微休息 ${microByHour[h]} 次` : "") +
+                (deepByHour[h] ? ` · 深休息 ${deepByHour[h]} 次` : "");
+              return (
+                <div key={h} title={tip} style={{ position: "relative", flex: 1, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", paddingBottom: 8 }}>
+                  <div style={{ position: "absolute", top: 4, display: "flex", gap: 2, alignItems: "center" }}>
+                    {deepByHour[h] > 0 && <span style={{ width: 6, height: 6, background: "#7b8ff0", borderRadius: 2 }} />}
+                    {microByHour[h] > 0 && <span style={{ width: 6, height: 6, background: "#2f9e80", borderRadius: "50%" }} />}
+                  </div>
+                  <div style={{ width: "100%", maxWidth: 13, height: barH, borderRadius: 3, background: active ? timelineBarColor(frac) : "transparent", boxShadow: active ? "inset 0 1px 0 rgba(255,255,255,.3)" : "none" }} />
+                </div>
+              );
+            })}
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 18, marginTop: 16, fontSize: 12.5, color: "#6f857c", fontWeight: 600 }}>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 9, height: 9, borderRadius: 3, background: "#3aa78c" }} />专注 {formatDuration(props.data.today.screenSeconds, true)}</span>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 9, height: 9, borderRadius: 3, background: "#9fdcc6" }} />微休息 {props.data.today.microDone} 次</span>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 9, height: 9, borderRadius: 3, background: "#7b8ff0" }} />深休息 {props.data.today.deepDone} 次</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 16, marginTop: 13, fontSize: 12.5, color: "#6f857c", fontWeight: 600, flexWrap: "wrap" }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 10, height: 10, borderRadius: 3, background: "linear-gradient(180deg,#8fd5b8,#1f7a64)" }} />用眼（满格 60 分）</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 8, height: 8, borderRadius: "50%", background: "#2f9e80" }} />微休息 {props.data.today.microDone} 次</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 8, height: 8, borderRadius: 2, background: "#7b8ff0" }} />深休息 {props.data.today.deepDone} 次</span>
             <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, background: "#1d3a32", color: "#fff", fontFamily: "'Manrope'", fontWeight: 700, fontSize: 12, padding: "5px 11px", borderRadius: 8 }}>现在 {nowLabel}</span>
           </div>
         </div>
@@ -1083,17 +1130,27 @@ function Overview(props: {
             <div style={{ fontFamily: "'Manrope'", fontSize: 15, fontWeight: 800, color: "#2c8e76" }}>{props.data.streakDays} 天</div>
           </div>
           <div style={{ display: "flex", justifyContent: "space-between" }}>
-            {["一", "二", "三", "四", "五", "六", "日"].map((d, i) => {
-              const done = i < Math.min(7, props.data.streakDays);
-              return (
-                <div key={d} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontSize: 12, color: "#9aada5", fontWeight: 600 }}>{d}</span>
-                  <span style={{ width: 30, height: 30, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", background: done ? "linear-gradient(135deg,#3fa98e,#2c8e76)" : "#eef3f1", border: done ? "none" : "1.5px solid #e0e9e5" }}>
-                    {done && <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round"><path d="M5 13l4 4L19 7" /></svg>}
-                  </span>
-                </div>
-              );
-            })}
+            {weekCells.map((cell, i) => (
+              <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 12, color: "#9aada5", fontWeight: 600 }}>{cell.label}</span>
+                <span
+                  style={{
+                    width: 30,
+                    height: 30,
+                    borderRadius: "50%",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: cell.state === "done" ? "linear-gradient(135deg,#3fa98e,#2c8e76)" : cell.state === "miss" ? "#f1f5f3" : "transparent",
+                    border: cell.state === "done" ? "none" : cell.state === "miss" ? "1.5px solid #e0e9e5" : "1.5px dashed #dbe6e1",
+                    opacity: cell.state === "future" ? 0.6 : 1
+                  }}
+                >
+                  {cell.state === "done" && <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round"><path d="M5 13l4 4L19 7" /></svg>}
+                  {cell.state === "miss" && <span style={{ width: 5, height: 5, borderRadius: "50%", background: "#cdd9d4" }} />}
+                </span>
+              </div>
+            ))}
           </div>
         </div>
 
