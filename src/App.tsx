@@ -943,15 +943,25 @@ function Overview(props: {
     };
   }, []);
 
-  // Per-hour completed micro/deep breaks today → timeline markers.
+  // Completed micro/deep breaks today, grouped by hour with their minute-of-hour so
+  // the timeline can place them in time order. The legend totals are summed from the
+  // same source, so the counts always match the bars on screen.
   const todayIso = localIsoDate(new Date());
-  const microByHour = Array<number>(24).fill(0);
-  const deepByHour = Array<number>(24).fill(0);
+  type RestMark = { minute: number; kind: "micro" | "deep" };
+  const restsByHour: RestMark[][] = Array.from({ length: 24 }, () => []);
+  let microCount = 0;
+  let deepCount = 0;
   for (const log of props.data.logs) {
     if (log.result !== "completed" || !log.at || log.at.slice(0, 10) !== todayIso) continue;
     const h = parseInt(log.at.slice(11, 13), 10);
-    if (h >= 0 && h < 24) (log.kind === "deep" ? deepByHour : microByHour)[h] += 1;
+    const m = parseInt(log.at.slice(14, 16), 10);
+    if (h < 0 || h >= 24) continue;
+    const kind: "micro" | "deep" = log.kind === "deep" ? "deep" : "micro";
+    restsByHour[h].push({ minute: Number.isFinite(m) ? clamp(m, 0, 59) : 0, kind });
+    if (kind === "deep") deepCount += 1;
+    else microCount += 1;
   }
+  for (const arr of restsByHour) arr.sort((a, b) => a.minute - b.minute);
 
   // Mon–Sun cells: done / miss (past + live today) / future (not yet reached).
   const todayQualified = props.data.today.microDone >= 1 && props.data.today.screenSeconds >= 1200;
@@ -1062,19 +1072,27 @@ function Overview(props: {
               const active = sec > 1;
               const fillH = active ? Math.max(3, Math.round(frac * SLOT_H)) : 0;
               const minutes = Math.round(sec / 60);
-              const deeps = Math.min(deepByHour[h], 5);
-              const micros = Math.min(microByHour[h], 5);
+              const marks = restsByHour[h];
+              const microN = marks.reduce((n, mk) => n + (mk.kind === "micro" ? 1 : 0), 0);
+              const deepN = marks.length - microN;
               const tip = `${String(h).padStart(2, "0")}:00 · 用眼 ${minutes} 分钟` +
-                (microByHour[h] ? ` · 微休息 ${microByHour[h]} 次` : "") +
-                (deepByHour[h] ? ` · 深休息 ${deepByHour[h]} 次` : "");
+                (microN ? ` · 微休息 ${microN} 次` : "") +
+                (deepN ? ` · 深休息 ${deepN} 次` : "");
+              // Position each break by its minute (top = :00, bottom = :59), nudging
+              // adjacent bars apart so they never overlap while keeping time order.
+              let lastTop = -10;
+              const placed = marks.map((mk) => {
+                let top = Math.round(3 + (mk.minute / 60) * (SLOT_H - 9));
+                if (top < lastTop + 4) top = lastTop + 4;
+                if (top > SLOT_H - 6) top = SLOT_H - 6;
+                lastTop = top;
+                return { top, kind: mk.kind };
+              });
               return (
                 <div key={h} title={tip} style={{ position: "relative", flex: 1, height: "100%", background: "#e6efeb", borderRadius: 4, overflow: "hidden" }}>
                   <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: fillH, background: active ? timelineBarColor(frac) : "transparent", zIndex: 1 }} />
-                  {Array.from({ length: deeps }).map((_, k) => (
-                    <div key={"d" + k} style={{ position: "absolute", left: 2, right: 2, top: 4 + k * 5, height: 3, borderRadius: 1.5, background: "#7b8ff0", boxShadow: "0 0 0 1px rgba(255,255,255,.8)", zIndex: 3 }} />
-                  ))}
-                  {Array.from({ length: micros }).map((_, k) => (
-                    <div key={"m" + k} style={{ position: "absolute", left: 2, right: 2, top: 4 + (deeps + k) * 5, height: 3, borderRadius: 1.5, background: "#34cda6", boxShadow: "0 0 0 1px rgba(255,255,255,.8)", zIndex: 3 }} />
+                  {placed.map((p, k) => (
+                    <div key={k} style={{ position: "absolute", left: 2, right: 2, top: p.top, height: 3, borderRadius: 1.5, background: p.kind === "deep" ? "#7b8ff0" : "#34cda6", boxShadow: "0 0 0 1px rgba(255,255,255,.8)", zIndex: 3 }} />
                   ))}
                 </div>
               );
@@ -1087,8 +1105,8 @@ function Overview(props: {
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 16, marginTop: 13, fontSize: 12.5, color: "#6f857c", fontWeight: 600, flexWrap: "wrap" }}>
             <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 10, height: 10, borderRadius: 3, background: "linear-gradient(180deg,#8fd5b8,#1f7a64)" }} />用眼（满格 60 分）</span>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3, borderRadius: 1.5, background: "#34cda6" }} />微休息 {props.data.today.microDone} 次</span>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3, borderRadius: 1.5, background: "#7b8ff0" }} />深休息 {props.data.today.deepDone} 次</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3, borderRadius: 1.5, background: "#34cda6" }} />微休息 {microCount} 次</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3, borderRadius: 1.5, background: "#7b8ff0" }} />深休息 {deepCount} 次</span>
             <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, background: "#1d3a32", color: "#fff", fontFamily: "'Manrope'", fontWeight: 700, fontSize: 12, padding: "5px 11px", borderRadius: 8 }}>现在 {nowLabel}</span>
           </div>
         </div>
