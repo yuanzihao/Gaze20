@@ -963,12 +963,6 @@ function Overview(props: {
   }
   for (const arr of restsByHour) arr.sort((a, b) => a.minute - b.minute);
 
-  // Today's average per-hour eye-use score (0–100), averaged over the hours that
-  // actually had screen use — shown as the vertical bar to the right of the timeline.
-  const usedHours = hourly.filter((s) => s > 60);
-  const avgScore = usedHours.length
-    ? Math.round((usedHours.reduce((a, s) => a + clamp(s / 3600, 0, 1), 0) / usedHours.length) * 100)
-    : 0;
 
   // Mon–Sun cells: done / miss (past + live today) / future (not yet reached).
   const todayQualified = props.data.today.microDone >= 1 && props.data.today.screenSeconds >= 1200;
@@ -1069,20 +1063,19 @@ function Overview(props: {
         <div style={{ ...dzCard, padding: "20px 22px" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 15, fontWeight: 700, color: "#1d3a32" }}>今日时间轴</div>
-            <div style={{ fontSize: 11.5, color: "#9aada5", fontWeight: 600 }}>每根 = 该小时用眼分（满分 100）· 横杆 = 微/深休息 · 右条 = 今日均分</div>
+            <div style={{ fontSize: 11.5, color: "#9aada5", fontWeight: 600 }}>柱高 = 该小时用眼时长 · 横杆 = 微/深休息 · 右条 = 当前用眼分</div>
           </div>
           <div style={{ position: "relative", height: SLOT_H, display: "flex", gap: 3, padding: "0 8px", marginTop: 14 }}>
             <div style={{ position: "absolute", left: 8, right: 30, top: SLOT_H / 2, borderTop: "1px dashed #c2d6cd", pointerEvents: "none", zIndex: 2 }} />
             {hourly.map((sec, h) => {
               const frac = clamp(sec / 3600, 0, 1);
               const active = sec > 1;
-              const hourScore = Math.round(frac * 100);
               const fillH = active ? Math.max(3, Math.round(frac * SLOT_H)) : 0;
               const minutes = Math.round(sec / 60);
               const marks = restsByHour[h];
               const microN = marks.reduce((n, mk) => n + (mk.kind === "micro" ? 1 : 0), 0);
               const deepN = marks.length - microN;
-              const tip = `${String(h).padStart(2, "0")}:00 · 用眼分 ${hourScore}/100（${minutes} 分钟）` +
+              const tip = `${String(h).padStart(2, "0")}:00 · 用眼 ${minutes} 分钟` +
                 (microN ? ` · 微休息 ${microN} 次` : "") +
                 (deepN ? ` · 深休息 ${deepN} 次` : "");
               // Position each break by its minute (top = :00, bottom = :59), nudging
@@ -1105,18 +1098,18 @@ function Overview(props: {
               );
             })}
             <div style={{ width: 1, flex: "none", alignSelf: "stretch", background: "#dde8e3" }} />
-            <div title={`今日平均用眼分 ${avgScore}/100（按有用眼的小时平均）`} style={{ position: "relative", width: 13, flex: "none", height: "100%", background: "#e6efeb", borderRadius: 4, overflow: "hidden" }}>
-              <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: Math.round((avgScore / 100) * SLOT_H), background: timelineBarColor(avgScore / 100) }} />
+            <div title={`当前用眼分 ${props.eyeScore}/100（越高越好）`} style={{ position: "relative", width: 13, flex: "none", height: "100%", background: "#e6efeb", borderRadius: 4, overflow: "hidden" }}>
+              <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: Math.round((props.eyeScore / 100) * SLOT_H), background: "linear-gradient(180deg,#5fcaa6,#2c8e76)" }} />
             </div>
           </div>
           <div style={{ display: "flex", gap: 3, padding: "0 8px", marginTop: 6, fontFamily: "'Manrope'", fontSize: 10, color: "#9aada5", fontWeight: 600 }}>
             {Array.from({ length: 24 }).map((_, h) => (
               <span key={h} style={{ flex: 1, minWidth: 0, textAlign: "center" }}>{h % 3 === 0 ? String(h).padStart(2, "0") : ""}</span>
             ))}
-            <span style={{ flex: "none", width: 17, textAlign: "right", color: "#2c8e76", fontWeight: 800, fontSize: 11 }}>{avgScore}</span>
+            <span style={{ flex: "none", width: 17, textAlign: "right", color: "#2c8e76", fontWeight: 800, fontSize: 11 }}>{props.eyeScore}</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 16, marginTop: 13, fontSize: 12.5, color: "#6f857c", fontWeight: 600, flexWrap: "wrap" }}>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 10, height: 10, borderRadius: 3, background: "linear-gradient(180deg,#8fd5b8,#1f7a64)" }} />用眼分（满分 100）</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 10, height: 10, borderRadius: 3, background: "linear-gradient(180deg,#8fd5b8,#1f7a64)" }} />用眼时长（满格 60 分）</span>
             <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3.5, borderRadius: 2, background: "#0bbf9b", boxShadow: "0 0 0 1px #fff" }} />微休息 {microCount} 次</span>
             <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3.5, borderRadius: 2, background: "#5b6ef0", boxShadow: "0 0 0 1px #fff" }} />深休息 {deepCount} 次</span>
             <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, background: "#1d3a32", color: "#fff", fontFamily: "'Manrope'", fontWeight: 700, fontSize: 12, padding: "5px 11px", borderRadius: 8 }}>现在 {nowLabel}</span>
