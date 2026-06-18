@@ -963,6 +963,13 @@ function Overview(props: {
   }
   for (const arr of restsByHour) arr.sort((a, b) => a.minute - b.minute);
 
+  // Today's average per-hour eye-use score (0–100), averaged over the hours that
+  // actually had screen use — shown as the vertical bar to the right of the timeline.
+  const usedHours = hourly.filter((s) => s > 60);
+  const avgScore = usedHours.length
+    ? Math.round((usedHours.reduce((a, s) => a + clamp(s / 3600, 0, 1), 0) / usedHours.length) * 100)
+    : 0;
+
   // Mon–Sun cells: done / miss (past + live today) / future (not yet reached).
   const todayQualified = props.data.today.microDone >= 1 && props.data.today.screenSeconds >= 1200;
   const weekMonday = new Date();
@@ -990,7 +997,7 @@ function Overview(props: {
 
   return (
     <div className="overview-shell">
-      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 20, minWidth: 0 }}>
         <div style={{ position: "relative", borderRadius: 22, overflow: "hidden", background: "linear-gradient(155deg,#e7f3ee 0%,#f1f8f5 52%,#eaf4f0 100%)", border: "1px solid #e0eee8", padding: "26px 28px" }}>
           <svg style={{ position: "absolute", right: 0, top: 0, height: "100%", width: "54%", opacity: 0.5 }} viewBox="0 0 420 320" preserveAspectRatio="xMaxYMid slice" fill="none">
             <circle cx="330" cy="78" r="40" fill="#d3e9df" />
@@ -1044,9 +1051,9 @@ function Overview(props: {
           </div>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,minmax(0,1fr))", gap: 14 }}>
           {statCards.map((card) => (
-            <div key={card.label} style={{ ...dzCardSm, padding: "16px 16px 15px" }}>
+            <div key={card.label} style={{ ...dzCardSm, padding: "16px 16px 15px", minWidth: 0 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
                 <span style={{ width: 30, height: 30, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center", background: card.bg }}>
                   <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke={card.color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{card.icon}</svg>
@@ -1062,20 +1069,20 @@ function Overview(props: {
         <div style={{ ...dzCard, padding: "20px 22px" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 15, fontWeight: 700, color: "#1d3a32" }}>今日时间轴</div>
-            <div style={{ fontSize: 11.5, color: "#9aada5", fontWeight: 600 }}>柱高 = 该小时用眼时长 · 横杆 = 当时的微/深休息</div>
+            <div style={{ fontSize: 11.5, color: "#9aada5", fontWeight: 600 }}>每根 = 该小时用眼分（满分 100）· 横杆 = 微/深休息 · 右条 = 今日均分</div>
           </div>
           <div style={{ position: "relative", height: SLOT_H, display: "flex", gap: 3, padding: "0 8px", marginTop: 14 }}>
-            <div style={{ position: "absolute", left: 8, right: 8, top: SLOT_H / 2, borderTop: "1px dashed #c2d6cd", pointerEvents: "none", zIndex: 2 }} />
-            <span style={{ position: "absolute", right: 9, top: SLOT_H / 2 - 13, fontSize: 9.5, color: "#a7bbb2", fontFamily: "'Manrope'", fontWeight: 600 }}>30 分</span>
+            <div style={{ position: "absolute", left: 8, right: 30, top: SLOT_H / 2, borderTop: "1px dashed #c2d6cd", pointerEvents: "none", zIndex: 2 }} />
             {hourly.map((sec, h) => {
               const frac = clamp(sec / 3600, 0, 1);
               const active = sec > 1;
+              const hourScore = Math.round(frac * 100);
               const fillH = active ? Math.max(3, Math.round(frac * SLOT_H)) : 0;
               const minutes = Math.round(sec / 60);
               const marks = restsByHour[h];
               const microN = marks.reduce((n, mk) => n + (mk.kind === "micro" ? 1 : 0), 0);
               const deepN = marks.length - microN;
-              const tip = `${String(h).padStart(2, "0")}:00 · 用眼 ${minutes} 分钟` +
+              const tip = `${String(h).padStart(2, "0")}:00 · 用眼分 ${hourScore}/100（${minutes} 分钟）` +
                 (microN ? ` · 微休息 ${microN} 次` : "") +
                 (deepN ? ` · 深休息 ${deepN} 次` : "");
               // Position each break by its minute (top = :00, bottom = :59), nudging
@@ -1089,24 +1096,29 @@ function Overview(props: {
                 return { top, kind: mk.kind };
               });
               return (
-                <div key={h} title={tip} style={{ position: "relative", flex: 1, height: "100%", background: "#e6efeb", borderRadius: 4, overflow: "hidden" }}>
+                <div key={h} title={tip} style={{ position: "relative", flex: 1, minWidth: 0, height: "100%", background: "#e6efeb", borderRadius: 4, overflow: "hidden" }}>
                   <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: fillH, background: active ? timelineBarColor(frac) : "transparent", zIndex: 1 }} />
                   {placed.map((p, k) => (
-                    <div key={k} style={{ position: "absolute", left: 2, right: 2, top: p.top, height: 3, borderRadius: 1.5, background: p.kind === "deep" ? "#7b8ff0" : "#34cda6", boxShadow: "0 0 0 1px rgba(255,255,255,.8)", zIndex: 3 }} />
+                    <div key={k} style={{ position: "absolute", left: 1, right: 1, top: p.top, height: 4, borderRadius: 2, background: p.kind === "deep" ? "#5b6ef0" : "#0bbf9b", boxShadow: "0 0 0 1.5px #ffffff, 0 1px 3px rgba(10,52,44,.55)", zIndex: 3 }} />
                   ))}
                 </div>
               );
             })}
+            <div style={{ width: 1, flex: "none", alignSelf: "stretch", background: "#dde8e3" }} />
+            <div title={`今日平均用眼分 ${avgScore}/100（按有用眼的小时平均）`} style={{ position: "relative", width: 13, flex: "none", height: "100%", background: "#e6efeb", borderRadius: 4, overflow: "hidden" }}>
+              <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: Math.round((avgScore / 100) * SLOT_H), background: timelineBarColor(avgScore / 100) }} />
+            </div>
           </div>
           <div style={{ display: "flex", gap: 3, padding: "0 8px", marginTop: 6, fontFamily: "'Manrope'", fontSize: 10, color: "#9aada5", fontWeight: 600 }}>
             {Array.from({ length: 24 }).map((_, h) => (
-              <span key={h} style={{ flex: 1, textAlign: "center" }}>{h % 3 === 0 ? String(h).padStart(2, "0") : ""}</span>
+              <span key={h} style={{ flex: 1, minWidth: 0, textAlign: "center" }}>{h % 3 === 0 ? String(h).padStart(2, "0") : ""}</span>
             ))}
+            <span style={{ flex: "none", width: 17, textAlign: "right", color: "#2c8e76", fontWeight: 800, fontSize: 11 }}>{avgScore}</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 16, marginTop: 13, fontSize: 12.5, color: "#6f857c", fontWeight: 600, flexWrap: "wrap" }}>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 10, height: 10, borderRadius: 3, background: "linear-gradient(180deg,#8fd5b8,#1f7a64)" }} />用眼（满格 60 分）</span>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3, borderRadius: 1.5, background: "#34cda6" }} />微休息 {microCount} 次</span>
-            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3, borderRadius: 1.5, background: "#7b8ff0" }} />深休息 {deepCount} 次</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 10, height: 10, borderRadius: 3, background: "linear-gradient(180deg,#8fd5b8,#1f7a64)" }} />用眼分（满分 100）</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3.5, borderRadius: 2, background: "#0bbf9b", boxShadow: "0 0 0 1px #fff" }} />微休息 {microCount} 次</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 3.5, borderRadius: 2, background: "#5b6ef0", boxShadow: "0 0 0 1px #fff" }} />深休息 {deepCount} 次</span>
             <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6, background: "#1d3a32", color: "#fff", fontFamily: "'Manrope'", fontWeight: 700, fontSize: 12, padding: "5px 11px", borderRadius: 8 }}>现在 {nowLabel}</span>
           </div>
         </div>

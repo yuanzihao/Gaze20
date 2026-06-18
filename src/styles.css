@@ -2529,13 +2529,13 @@ body.overlay-body .overlay-privacy {
 
 @media (max-width: 1360px) {
   .overview-shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
 @media (max-width: 1180px) {
   .overview-shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .overview-grid,
