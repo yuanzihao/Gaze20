@@ -93,7 +93,11 @@ pub enum Decision {
 
 /// The full runtime state. Persistent "today" counters round-trip through JSON
 /// (a settings row) so a restart resumes mid-day; transient fields reset on load.
+// `#[serde(default)]` (container-level): when an older persisted JSON is missing a
+// field added in a newer build, that field falls back to `Default` instead of failing
+// the whole deserialize (which used to silently reset the day + streak on upgrade).
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Engine {
     pub mode: Mode,
     pub running: bool,
@@ -466,5 +470,19 @@ mod tests {
         assert_eq!(next_streak(3, true, true), 4); // qualified + consecutive → +1
         assert_eq!(next_streak(3, false, true), 1); // missed the guard → reset
         assert_eq!(next_streak(3, true, false), 1); // a gap broke the chain → reset
+    }
+
+    #[test]
+    fn deserialize_tolerates_missing_fields() {
+        // An older persisted JSON lacking fields added in a newer build must still
+        // load (serde default fills the gaps) instead of failing and resetting state.
+        let json = r#"{"mode":"intense","running":true,"streak_days":7,"date":"2026-06-19"}"#;
+        let e: Engine = serde_json::from_str(json).expect("missing fields fall back to default");
+        assert_eq!(e.mode, Mode::Intense);
+        assert_eq!(e.streak_days, 7);
+        assert_eq!(e.date, "2026-06-19");
+        // Fields absent from the JSON take their Default values.
+        assert_eq!(e.reading_grace_minutes, Engine::default().reading_grace_minutes);
+        assert_eq!(e.micro_done, 0);
     }
 }

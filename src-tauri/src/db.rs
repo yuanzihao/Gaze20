@@ -17,7 +17,7 @@ use rusqlite::{params, Connection, Transaction};
 
 /// Bump this when adding a migration below. The chain runs from the DB's current
 /// version up to here, one transaction per step.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Managed Tauri state: the single owned connection behind a mutex (rusqlite's
 /// `Connection` is not `Sync`).
@@ -127,6 +127,7 @@ fn apply_migration(tx: &Transaction, version: i64) -> Result<(), String> {
         2 => MIGRATION_V2,
         3 => MIGRATION_V3,
         4 => MIGRATION_V4,
+        5 => MIGRATION_V5,
         other => return Err(format!("no migration defined for schema v{other}")),
     };
     tx.execute_batch(sql)
@@ -228,6 +229,29 @@ const MIGRATION_V4: &str = "
         WHERE at_ms IS NULL AND at IS NOT NULL;
     CREATE INDEX idx_reminder_at_ms ON reminder_events(at_ms);
     CREATE INDEX idx_symptom_at_ms ON symptom_records(at_ms);
+";
+
+/// V5 — the raw activity fact layer is finally wired up. The V2 `activity_sessions`
+/// table was designed but never written, so it is safe to drop and recreate with a
+/// proper, timezone-safe, analysis-ready shape: one row per contiguous span of real
+/// eye-use with the same foreground process + activity state. `started_ms`/`ended_ms`
+/// are UTC epoch milliseconds; `date`/`hour` are the local-day/local-hour the session
+/// started in (cheap grouping keys). `state` is `active` / `reading` / `meeting`, and
+/// `process` enables future per-app analysis. Privacy unchanged: process name only.
+const MIGRATION_V5: &str = "
+    DROP TABLE IF EXISTS activity_sessions;
+    CREATE TABLE activity_sessions (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_ms     INTEGER NOT NULL,
+        ended_ms       INTEGER,
+        active_seconds REAL    NOT NULL DEFAULT 0,
+        state          TEXT    NOT NULL DEFAULT 'active',
+        process        TEXT,
+        date           TEXT    NOT NULL,
+        hour           INTEGER NOT NULL
+    );
+    CREATE INDEX idx_activity_started_ms ON activity_sessions(started_ms);
+    CREATE INDEX idx_activity_date ON activity_sessions(date);
 ";
 
 // ---- Settings access -------------------------------------------------------
@@ -417,43 +441,37 @@ pub fn recent_symptoms(conn: &Connection, limit: i64) -> Result<Vec<SymptomRow>,
 
 // ---- Fact tables: activity sessions ---------------------------------------
 
-/// Open a new activity interval and return its id. The engine bumps and closes it
-/// as real eye-use time accrues. Wired for the hourly heatmap in Phase 3.
-#[allow(dead_code)]
+/// Open an activity session and return its id. `started_ms` is UTC epoch ms; `date`
+/// (local `YYYY-MM-DD`) and `hour` (local 0-23) are stored for cheap day/hour grouping.
 pub fn open_activity_session(
     conn: &Connection,
-    started_at: Option<&str>,
+    started_ms: i64,
+    state: &str,
     process: Option<&str>,
-    reading: bool,
+    date: &str,
+    hour: i64,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO activity_sessions(started_at, process, reading, active_seconds) \
-         VALUES(COALESCE(?1, datetime('now','localtime')), ?2, ?3, 0)",
-        params![started_at, process, reading as i64],
+        "INSERT INTO activity_sessions(started_ms, state, process, date, hour, active_seconds) \
+         VALUES(?1, ?2, ?3, ?4, ?5, 0)",
+        params![started_ms, state, process, date, hour],
     )
     .map_err(|e| format!("open activity_session: {e}"))?;
     Ok(conn.last_insert_rowid())
 }
 
-/// Update an open session's accrued seconds and (optionally) mark it ended.
-#[allow(dead_code)]
+/// Update an open session's accrued seconds; pass `ended_ms` (UTC epoch ms) to close it.
 pub fn update_activity_session(
     conn: &Connection,
     id: i64,
     active_seconds: f64,
-    ended: bool,
+    ended_ms: Option<i64>,
 ) -> Result<(), String> {
-    if ended {
-        conn.execute(
-            "UPDATE activity_sessions SET active_seconds = ?2, ended_at = datetime('now','localtime') WHERE id = ?1",
-            params![id, active_seconds],
-        )
-    } else {
-        conn.execute(
-            "UPDATE activity_sessions SET active_seconds = ?2 WHERE id = ?1",
-            params![id, active_seconds],
-        )
-    }
+    conn.execute(
+        "UPDATE activity_sessions \
+         SET active_seconds = ?2, ended_ms = COALESCE(?3, ended_ms) WHERE id = ?1",
+        params![id, active_seconds, ended_ms],
+    )
     .map_err(|e| format!("update activity_session {id}: {e}"))?;
     Ok(())
 }
@@ -664,6 +682,7 @@ pub fn prune_old(conn: &Connection, days: i64) -> Result<(), String> {
     }
     let _ = conn.execute("DELETE FROM reminder_events WHERE at < ?1", params![cutoff]);
     let _ = conn.execute("DELETE FROM hourly_stats WHERE date < ?1", params![cutoff]);
+    let _ = conn.execute("DELETE FROM activity_sessions WHERE date < ?1", params![cutoff]);
     Ok(())
 }
 
@@ -834,6 +853,28 @@ mod tests {
         let syms = recent_symptoms(&conn, 10).unwrap();
         assert_eq!(syms.len(), 1);
         assert!(syms[0].at_ms.is_some(), "symptom at_ms back-filled from legacy string");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn activity_session_open_accrue_close() {
+        let path = temp_path();
+        let conn = open(&path).unwrap();
+        let id = open_activity_session(&conn, 1_700_000_000_000, "active", Some("chrome.exe"), "2026-06-19", 14).unwrap();
+        update_activity_session(&conn, id, 30.0, None).unwrap(); // accrue, still open
+        update_activity_session(&conn, id, 45.0, Some(1_700_000_045_000)).unwrap(); // close
+        let (secs, ended, state, process): (f64, Option<i64>, String, Option<String>) = conn
+            .query_row(
+                "SELECT active_seconds, ended_ms, state, process FROM activity_sessions WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert!((secs - 45.0).abs() < 1e-9);
+        assert_eq!(ended, Some(1_700_000_045_000));
+        assert_eq!(state, "active");
+        assert_eq!(process.as_deref(), Some("chrome.exe"));
         drop(conn);
         cleanup(&path);
     }

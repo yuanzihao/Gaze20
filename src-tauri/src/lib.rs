@@ -499,17 +499,20 @@ fn record_reminder_event<R: Runtime>(
 }
 
 fn persist_engine<R: Runtime>(app: &AppHandle<R>) {
-    let json = match app.try_state::<EngineHandle>() {
-        Some(eh) => eh
-            .engine
-            .lock()
-            .ok()
-            .and_then(|e| serde_json::to_string(&*e).ok()),
+    let snapshot = match app.try_state::<EngineHandle>() {
+        Some(eh) => eh.engine.lock().ok().and_then(|e| {
+            serde_json::to_string(&*e)
+                .ok()
+                .map(|json| (json, e.streak_days))
+        }),
         None => None,
     };
-    if let (Some(json), Some(db)) = (json, app.try_state::<db::Database>()) {
+    if let (Some((json, streak)), Some(db)) = (snapshot, app.try_state::<db::Database>()) {
         if let Ok(conn) = db.conn.lock() {
             let _ = db::set_setting(&conn, "engine_state", &json);
+            // Redundant copy: if the engine_state blob is ever unreadable, the streak
+            // (a long-running, hard-to-recompute value) can still be recovered.
+            let _ = db::set_setting(&conn, "streak_days", &streak.to_string());
         }
     }
 }
@@ -574,8 +577,19 @@ fn load_engine<R: Runtime>(app: &AppHandle<R>) -> engine::Engine {
     if let Some(db) = app.try_state::<db::Database>() {
         if let Ok(conn) = db.conn.lock() {
             if let Some(json) = db::get_setting(&conn, "engine_state") {
-                if let Ok(loaded) = serde_json::from_str::<engine::Engine>(&json) {
-                    e = loaded;
+                match serde_json::from_str::<engine::Engine>(&json) {
+                    Ok(loaded) => e = loaded,
+                    Err(error) => {
+                        // Only a breaking change (not a mere added field, thanks to
+                        // serde default) reaches here; recover the streak from its
+                        // redundant copy so an upgrade never silently zeroes it.
+                        log::error!("engine_state parse failed ({error}); keeping defaults, recovering streak");
+                        if let Some(s) = db::get_setting(&conn, "streak_days") {
+                            if let Ok(v) = s.parse::<i64>() {
+                                e.streak_days = v;
+                            }
+                        }
+                    }
                 }
             }
             if e.date.is_empty() {
@@ -664,6 +678,33 @@ fn schedule_fire_reminder<R: Runtime + 'static>(
     });
 }
 
+/// Loop-local state for the raw activity fact layer: the currently-open session plus
+/// how much eye-use has accrued into it since the last flush to the database.
+#[derive(Default)]
+struct ActivityTracker {
+    id: Option<i64>,
+    process: String,
+    state: &'static str,
+    accrued: f64,
+    unflushed: f64,
+}
+
+/// Classify this tick into an activity-session state, or `None` when no real eye-use
+/// accrued (idle / away / paused / a reminder on screen) — which closes any open span.
+fn activity_state(snap: &ActivitySnapshot, accumulated: f64) -> Option<&'static str> {
+    if accumulated <= 0.0 {
+        None
+    } else if snap.input_active {
+        Some("active")
+    } else if snap.should_defer {
+        Some("meeting")
+    } else if snap.reading_active {
+        Some("reading")
+    } else {
+        Some("active")
+    }
+}
+
 /// The 1-second authority loop. Polls activity, advances the engine, performs the
 /// single decision (fire native overlay / record a deferral), persists, and emits
 /// live state. Runs regardless of whether the main window is visible.
@@ -671,6 +712,7 @@ fn spawn_engine_loop<R: Runtime + 'static>(app: AppHandle<R>) {
     std::thread::spawn(move || {
         let mut last = std::time::Instant::now();
         let mut ticks: u64 = 0;
+        let mut session = ActivityTracker::default();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             let now = std::time::Instant::now();
@@ -733,6 +775,46 @@ fn spawn_engine_loop<R: Runtime + 'static>(app: AppHandle<R>) {
                     if let Ok(conn) = db.conn.lock() {
                         let hour = db::local_hour(&conn);
                         let _ = db::add_hourly_seconds(&conn, &today, hour, accumulated);
+                    }
+                }
+            }
+
+            // Raw activity fact layer: one row per contiguous (process, state) span of
+            // real eye-use. Accrue within a span; close + reopen on any change; flush
+            // every ~5s so a crash loses little. Idle/paused closes the open span.
+            if let Some(db) = app.try_state::<db::Database>() {
+                if let Ok(conn) = db.conn.lock() {
+                    match activity_state(&snap, accumulated) {
+                        None => {
+                            if let Some(id) = session.id.take() {
+                                let _ = db::update_activity_session(&conn, id, session.accrued, Some(now_ms_val as i64));
+                            }
+                        }
+                        Some(state) => {
+                            let process = snap.foreground_process.clone();
+                            if session.id.is_none() || session.state != state || session.process != process {
+                                if let Some(id) = session.id.take() {
+                                    let _ = db::update_activity_session(&conn, id, session.accrued, Some(now_ms_val as i64));
+                                }
+                                let hour = db::local_hour(&conn);
+                                let proc_opt = (!process.is_empty()).then_some(process.as_str());
+                                if let Ok(id) = db::open_activity_session(&conn, now_ms_val as i64, state, proc_opt, &today, hour) {
+                                    session.id = Some(id);
+                                    session.state = state;
+                                    session.process = process.clone();
+                                    session.accrued = 0.0;
+                                    session.unflushed = 0.0;
+                                }
+                            }
+                            if let Some(id) = session.id {
+                                session.accrued += accumulated;
+                                session.unflushed += accumulated;
+                                if session.unflushed >= 5.0 {
+                                    let _ = db::update_activity_session(&conn, id, session.accrued, None);
+                                    session.unflushed = 0.0;
+                                }
+                            }
+                        }
                     }
                 }
             }
