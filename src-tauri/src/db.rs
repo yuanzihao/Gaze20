@@ -305,7 +305,7 @@ pub fn schema_version(conn: &Connection) -> i64 {
 
 // ---- Fact tables: reminder events -----------------------------------------
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReminderEventRow {
     pub id: i64,
@@ -476,6 +476,46 @@ pub fn update_activity_session(
     Ok(())
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySessionRow {
+    pub started_ms: i64,
+    pub ended_ms: Option<i64>,
+    pub active_seconds: f64,
+    pub state: String,
+    pub process: Option<String>,
+    pub date: String,
+    pub hour: i64,
+}
+
+/// Most-recent `limit` activity sessions, newest first (used by the data export).
+pub fn recent_activity_sessions(
+    conn: &Connection,
+    limit: i64,
+) -> Result<Vec<ActivitySessionRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT started_ms, ended_ms, active_seconds, state, process, date, hour \
+             FROM activity_sessions ORDER BY started_ms DESC LIMIT ?1",
+        )
+        .map_err(|e| format!("prepare activity_sessions: {e}"))?;
+    let rows = stmt
+        .query_map([limit], |row| {
+            Ok(ActivitySessionRow {
+                started_ms: row.get(0)?,
+                ended_ms: row.get(1)?,
+                active_seconds: row.get(2)?,
+                state: row.get(3)?,
+                process: row.get(4)?,
+                date: row.get(5)?,
+                hour: row.get(6)?,
+            })
+        })
+        .map_err(|e| format!("query activity_sessions: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read activity_sessions rows: {e}"))
+}
+
 // ---- Aggregate tables (V3): daily_stats + hourly_stats ---------------------
 
 /// Today's local hour (0-23) via SQLite, so no chrono dependency.
@@ -618,7 +658,7 @@ pub fn query_state_breakdown(
         .map_err(|e| format!("read state_breakdown rows: {e}"))
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyStatsRow {
     pub date: String,
@@ -666,7 +706,7 @@ pub fn query_daily_stats(conn: &Connection, limit: i64) -> Result<Vec<DailyStats
         .map_err(|e| format!("read daily_stats rows: {e}"))
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HourlyStatsRow {
     pub date: String,
@@ -756,20 +796,119 @@ pub fn prune_old(conn: &Connection, days: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// Build a complete, privacy-safe data export (aggregates + facts, no window
-/// titles, no internal engine blob) as pretty JSON.
+/// Build a complete, privacy-safe data export (aggregates + facts, no window titles,
+/// no internal engine blob) as pretty JSON. Round-trips with [`import_json`].
 pub fn export_json(conn: &Connection) -> Result<String, String> {
     let daily = query_daily_stats(conn, 3650)?;
+    let hourly = query_hourly_stats(conn, "1970-01-01")?;
     let reminders = recent_reminder_events(conn, 1_000_000)?;
     let symptoms = recent_symptoms(conn, 1_000_000)?;
+    let activity = recent_activity_sessions(conn, 1_000_000)?;
     let payload = serde_json::json!({
         "exportedAt": today_local(conn),
         "schemaVersion": current_version(conn),
+        "exportFormat": 2,
         "dailyStats": daily,
+        "hourlyStats": hourly,
         "reminderEvents": reminders,
         "symptoms": symptoms,
+        "activitySessions": activity,
     });
     serde_json::to_string_pretty(&payload).map_err(|e| format!("serialize export: {e}"))
+}
+
+/// How many new rows an import inserted per table.
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSummary {
+    pub daily: i64,
+    pub hourly: i64,
+    pub reminders: i64,
+    pub symptoms: i64,
+    pub activity: i64,
+}
+
+/// Merge a previously-exported JSON into this database in a single transaction.
+/// Idempotent: rows that already exist (by natural key — date, (date,hour), or
+/// timestamp+content) are skipped, so re-importing or merging two machines is safe and
+/// never overwrites the local data. Returns the count of newly inserted rows per table.
+pub fn import_json(conn: &mut Connection, json: &str) -> Result<ImportSummary, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("parse import json: {e}"))?;
+    let tx = conn.transaction().map_err(|e| format!("begin import tx: {e}"))?;
+    let mut s = ImportSummary::default();
+
+    if let Some(arr) = v.get("dailyStats") {
+        let daily: Vec<DailyStatsRow> =
+            serde_json::from_value(arr.clone()).map_err(|e| format!("parse dailyStats: {e}"))?;
+        for d in daily {
+            s.daily += tx
+                .execute(
+                    "INSERT OR IGNORE INTO daily_stats(date, screen_seconds, distant_gaze_seconds, \
+                         micro_due, micro_done, deep_due, deep_done, skipped, postponed, deferred, \
+                         risk_score, risk_peak) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                    params![d.date, d.screen_seconds, d.distant_gaze_seconds, d.micro_due, d.micro_done, d.deep_due, d.deep_done, d.skipped, d.postponed, d.deferred, d.risk_score, d.risk_peak],
+                )
+                .map_err(|e| format!("import daily: {e}"))? as i64;
+        }
+    }
+    if let Some(arr) = v.get("hourlyStats") {
+        let hourly: Vec<HourlyStatsRow> =
+            serde_json::from_value(arr.clone()).map_err(|e| format!("parse hourlyStats: {e}"))?;
+        for h in hourly {
+            s.hourly += tx
+                .execute(
+                    "INSERT OR IGNORE INTO hourly_stats(date, hour, screen_seconds) VALUES(?1,?2,?3)",
+                    params![h.date, h.hour, h.screen_seconds],
+                )
+                .map_err(|e| format!("import hourly: {e}"))? as i64;
+        }
+    }
+    if let Some(arr) = v.get("reminderEvents") {
+        let rows: Vec<ReminderEventRow> =
+            serde_json::from_value(arr.clone()).map_err(|e| format!("parse reminderEvents: {e}"))?;
+        for r in rows {
+            s.reminders += tx
+                .execute(
+                    "INSERT INTO reminder_events(at, at_ms, kind, result, active_seconds, gaze_seconds, note) \
+                     SELECT ?1,?2,?3,?4,?5,?6,?7 \
+                     WHERE NOT EXISTS(SELECT 1 FROM reminder_events WHERE at_ms IS ?2 AND kind=?3 AND result=?4 AND active_seconds=?5)",
+                    params![r.at, r.at_ms, r.kind, r.result, r.active_seconds, r.gaze_seconds, r.note],
+                )
+                .map_err(|e| format!("import reminder: {e}"))? as i64;
+        }
+    }
+    if let Some(arr) = v.get("symptoms") {
+        let rows: Vec<SymptomRow> =
+            serde_json::from_value(arr.clone()).map_err(|e| format!("parse symptoms: {e}"))?;
+        for r in rows {
+            s.symptoms += tx
+                .execute(
+                    "INSERT INTO symptom_records(at, at_ms, dry, blur, headache, neck, note, screen_seconds) \
+                     SELECT ?1,?2,?3,?4,?5,?6,?7,?8 \
+                     WHERE NOT EXISTS(SELECT 1 FROM symptom_records WHERE at_ms IS ?2 AND dry=?3 AND blur=?4 AND headache=?5 AND neck=?6)",
+                    params![r.at, r.at_ms, r.dry, r.blur, r.headache, r.neck, r.note, r.screen_seconds],
+                )
+                .map_err(|e| format!("import symptom: {e}"))? as i64;
+        }
+    }
+    if let Some(arr) = v.get("activitySessions") {
+        let rows: Vec<ActivitySessionRow> =
+            serde_json::from_value(arr.clone()).map_err(|e| format!("parse activitySessions: {e}"))?;
+        for a in rows {
+            s.activity += tx
+                .execute(
+                    "INSERT INTO activity_sessions(started_ms, ended_ms, active_seconds, state, process, date, hour) \
+                     SELECT ?1,?2,?3,?4,?5,?6,?7 \
+                     WHERE NOT EXISTS(SELECT 1 FROM activity_sessions WHERE started_ms=?1 AND process IS ?5)",
+                    params![a.started_ms, a.ended_ms, a.active_seconds, a.state, a.process, a.date, a.hour],
+                )
+                .map_err(|e| format!("import activity: {e}"))? as i64;
+        }
+    }
+
+    tx.commit().map_err(|e| format!("commit import: {e}"))?;
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -977,6 +1116,33 @@ mod tests {
         assert!(query_app_usage(&conn, "2026-06-20", 10).unwrap().is_empty(), "since filter excludes earlier days");
         drop(conn);
         cleanup(&path);
+    }
+
+    #[test]
+    fn export_import_roundtrip_is_idempotent() {
+        let src = temp_path();
+        let conn = open(&src).unwrap();
+        insert_reminder_event(&conn, None, Some(1000), "micro", "completed", 100.0, 20.0, Some("x")).unwrap();
+        insert_symptom(&conn, None, Some(2000), 3, 2, 1, 0, None, 1200.0).unwrap();
+        upsert_daily_stats(&conn, &agg("2026-06-19", 40)).unwrap();
+        add_hourly_seconds(&conn, "2026-06-19", 14, 100.0).unwrap();
+        let aid = open_activity_session(&conn, 5000, "active", Some("chrome.exe"), "2026-06-19", 14).unwrap();
+        update_activity_session(&conn, aid, 60.0, Some(6000)).unwrap();
+        let json = export_json(&conn).unwrap();
+        drop(conn);
+
+        let dst = temp_path();
+        let mut conn2 = open(&dst).unwrap();
+        let s1 = import_json(&mut conn2, &json).unwrap();
+        assert_eq!((s1.daily, s1.hourly, s1.reminders, s1.symptoms, s1.activity), (1, 1, 1, 1, 1), "fresh import inserts all");
+        let s2 = import_json(&mut conn2, &json).unwrap();
+        assert_eq!((s2.daily, s2.hourly, s2.reminders, s2.symptoms, s2.activity), (0, 0, 0, 0, 0), "re-import is fully deduped");
+        assert_eq!(recent_reminder_events(&conn2, 10).unwrap().len(), 1);
+        assert_eq!(query_daily_stats(&conn2, 10).unwrap().len(), 1);
+        assert_eq!(recent_symptoms(&conn2, 10).unwrap()[0].dry, 3);
+        drop(conn2);
+        cleanup(&src);
+        cleanup(&dst);
     }
 
     #[test]

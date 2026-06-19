@@ -2025,6 +2025,46 @@ function Settings(props: {
       setChecking(false);
     }
   }
+  const [dataMsg, setDataMsg] = useState<string | null>(null);
+  async function exportAll() {
+    const json = await safeInvoke<string>("db_export");
+    if (!json) {
+      setDataMsg("导出失败");
+      return;
+    }
+    const blob = new Blob([json], { type: "application/json" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `gaze20-backup-${todayKey()}.json`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    setDataMsg("已导出全部数据");
+  }
+  function pickImport() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/json,.json";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      setDataMsg("导入中…");
+      try {
+        const text = await file.text();
+        const sum = await safeInvoke<{ daily: number; hourly: number; reminders: number; symptoms: number; activity: number }>(
+          "db_import",
+          { json: text }
+        );
+        setDataMsg(
+          sum
+            ? `已导入新增：日 ${sum.daily} · 时段 ${sum.hourly} · 提醒 ${sum.reminders} · 症状 ${sum.symptoms} · 活动 ${sum.activity}`
+            : "导入失败：文件格式不对"
+        );
+      } catch {
+        setDataMsg("导入失败：无法读取文件");
+      }
+    };
+    input.click();
+  }
   return (
     <div className="settings-grid">
       <section className="wide-card">
@@ -2110,6 +2150,16 @@ function Settings(props: {
           >
             {checking ? "检查中…" : "检查更新"}
           </button>
+        </div>
+        <div className="slider-row" style={{ gridTemplateColumns: "1fr auto auto", gap: 8, marginTop: 18, alignItems: "center" }}>
+          <span style={{ fontWeight: 800 }}>
+            数据导出 / 导入
+            <span style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#6f857c", marginTop: 4 }}>
+              {dataMsg ?? "换机/重装可导出备份；导入会合并并跳过重复，不覆盖本机数据。"}
+            </span>
+          </span>
+          <button onClick={exportAll} style={{ background: "#eef6f2", color: "#1f7a64", border: "none", borderRadius: 12, padding: "9px 16px", fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}>导出全部</button>
+          <button onClick={pickImport} style={{ background: "#eef6f2", color: "#1f7a64", border: "none", borderRadius: 12, padding: "9px 16px", fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}>导入</button>
         </div>
       </section>
 

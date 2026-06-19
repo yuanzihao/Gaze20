@@ -386,6 +386,12 @@ fn db_export(db: State<db::Database>) -> Result<String, String> {
     db::export_json(&conn)
 }
 
+#[tauri::command]
+fn db_import(db: State<db::Database>, json: String) -> Result<db::ImportSummary, String> {
+    let mut conn = db.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
+    db::import_json(&mut conn, &json)
+}
+
 /// Check the configured update endpoint. Returns the new version string if one is
 /// available, `None` if up to date. Errors (e.g. "updater not configured") are
 /// surfaced so the UI can say so — see doc/RELEASE.md to activate updates.
@@ -1382,6 +1388,7 @@ pub fn run() {
             db_app_usage,
             db_state_breakdown,
             db_export,
+            db_import,
             check_for_update,
             engine_get_state,
             engine_set_running,
