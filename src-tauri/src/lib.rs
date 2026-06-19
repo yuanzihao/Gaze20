@@ -294,6 +294,7 @@ fn db_add_symptom(
     db::insert_symptom(
         &conn,
         None,
+        Some(now_ms() as i64),
         dry,
         blur,
         headache,
@@ -492,7 +493,7 @@ fn record_reminder_event<R: Runtime>(
 ) {
     if let Some(db) = app.try_state::<db::Database>() {
         if let Ok(conn) = db.conn.lock() {
-            let _ = db::insert_reminder_event(&conn, None, kind, result, active, gaze, note);
+            let _ = db::insert_reminder_event(&conn, None, Some(now_ms() as i64), kind, result, active, gaze, note);
         }
     }
 }
@@ -999,6 +1000,7 @@ fn import_legacy_json<R: Runtime>(app: &AppHandle<R>) {
         let _ = db::insert_reminder_event(
             &conn,
             non_empty(&log.at),
+            None,
             kind,
             &log.result,
             log.active_seconds,
@@ -1010,6 +1012,7 @@ fn import_legacy_json<R: Runtime>(app: &AppHandle<R>) {
         let _ = db::insert_symptom(
             &conn,
             non_empty(&symptom.at),
+            None,
             symptom.scores.dry,
             symptom.scores.blur,
             symptom.scores.headache,

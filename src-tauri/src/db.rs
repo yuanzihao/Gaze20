@@ -17,7 +17,7 @@ use rusqlite::{params, Connection, Transaction};
 
 /// Bump this when adding a migration below. The chain runs from the DB's current
 /// version up to here, one transaction per step.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Managed Tauri state: the single owned connection behind a mutex (rusqlite's
 /// `Connection` is not `Sync`).
@@ -126,6 +126,7 @@ fn apply_migration(tx: &Transaction, version: i64) -> Result<(), String> {
         1 => MIGRATION_V1,
         2 => MIGRATION_V2,
         3 => MIGRATION_V3,
+        4 => MIGRATION_V4,
         other => return Err(format!("no migration defined for schema v{other}")),
     };
     tx.execute_batch(sql)
@@ -211,6 +212,24 @@ const MIGRATION_V3: &str = "
     );
 ";
 
+/// V4 — timezone-safe event timestamps. Adds `at_ms` (UTC epoch milliseconds) to the
+/// fact tables alongside the legacy local-time text `at`, and back-fills it from the
+/// existing rows (best-effort: the old local strings are interpreted in the machine's
+/// current timezone). New writes set `at_ms` directly from a UTC clock; the UI reads
+/// `at_ms` so timestamps stay correct across timezone changes / DST.
+const MIGRATION_V4: &str = "
+    ALTER TABLE reminder_events ADD COLUMN at_ms INTEGER;
+    ALTER TABLE symptom_records ADD COLUMN at_ms INTEGER;
+    UPDATE reminder_events
+        SET at_ms = CAST(strftime('%s', at, 'utc') AS INTEGER) * 1000
+        WHERE at_ms IS NULL AND at IS NOT NULL;
+    UPDATE symptom_records
+        SET at_ms = CAST(strftime('%s', at, 'utc') AS INTEGER) * 1000
+        WHERE at_ms IS NULL AND at IS NOT NULL;
+    CREATE INDEX idx_reminder_at_ms ON reminder_events(at_ms);
+    CREATE INDEX idx_symptom_at_ms ON symptom_records(at_ms);
+";
+
 // ---- Settings access -------------------------------------------------------
 
 pub fn get_all_settings(conn: &Connection) -> Result<BTreeMap<String, String>, String> {
@@ -272,23 +291,31 @@ pub struct ReminderEventRow {
     pub active_seconds: f64,
     pub gaze_seconds: f64,
     pub note: Option<String>,
+    /// UTC epoch milliseconds (timezone-safe); `None` only for un-back-fillable rows.
+    pub at_ms: Option<i64>,
 }
 
 /// Record one reminder lifecycle event. `at` defaults to now when `None` (live
 /// recording); an explicit timestamp is used by the legacy-JSON import (Phase 4).
+#[allow(clippy::too_many_arguments)]
 pub fn insert_reminder_event(
     conn: &Connection,
     at: Option<&str>,
+    at_ms: Option<i64>,
     kind: &str,
     result: &str,
     active_seconds: f64,
     gaze_seconds: f64,
     note: Option<&str>,
 ) -> Result<i64, String> {
+    // Live callers pass `at_ms` (a UTC clock); the legacy import passes `None` and the
+    // local `at` string is converted to a UTC epoch here (best-effort by machine tz).
     conn.execute(
-        "INSERT INTO reminder_events(at, kind, result, active_seconds, gaze_seconds, note) \
-         VALUES(COALESCE(?1, datetime('now','localtime')), ?2, ?3, ?4, ?5, ?6)",
-        params![at, kind, result, active_seconds, gaze_seconds, note],
+        "INSERT INTO reminder_events(at, at_ms, kind, result, active_seconds, gaze_seconds, note) \
+         VALUES(COALESCE(?1, datetime('now','localtime')), \
+                COALESCE(?2, CAST(strftime('%s', ?1, 'utc') AS INTEGER) * 1000), \
+                ?3, ?4, ?5, ?6, ?7)",
+        params![at, at_ms, kind, result, active_seconds, gaze_seconds, note],
     )
     .map_err(|e| format!("insert reminder_event: {e}"))?;
     Ok(conn.last_insert_rowid())
@@ -300,8 +327,8 @@ pub fn recent_reminder_events(
 ) -> Result<Vec<ReminderEventRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, at, kind, result, active_seconds, gaze_seconds, note \
-             FROM reminder_events ORDER BY at DESC, id DESC LIMIT ?1",
+            "SELECT id, at, kind, result, active_seconds, gaze_seconds, note, at_ms \
+             FROM reminder_events ORDER BY at_ms DESC, id DESC LIMIT ?1",
         )
         .map_err(|e| format!("prepare recent reminders: {e}"))?;
     let rows = stmt
@@ -314,6 +341,7 @@ pub fn recent_reminder_events(
                 active_seconds: row.get(4)?,
                 gaze_seconds: row.get(5)?,
                 note: row.get(6)?,
+                at_ms: row.get(7)?,
             })
         })
         .map_err(|e| format!("query recent reminders: {e}"))?;
@@ -334,12 +362,15 @@ pub struct SymptomRow {
     pub neck: i64,
     pub note: Option<String>,
     pub screen_seconds: f64,
+    /// UTC epoch milliseconds (timezone-safe); `None` only for un-back-fillable rows.
+    pub at_ms: Option<i64>,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn insert_symptom(
     conn: &Connection,
     at: Option<&str>,
+    at_ms: Option<i64>,
     dry: i64,
     blur: i64,
     headache: i64,
@@ -348,9 +379,11 @@ pub fn insert_symptom(
     screen_seconds: f64,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO symptom_records(at, dry, blur, headache, neck, note, screen_seconds) \
-         VALUES(COALESCE(?1, datetime('now','localtime')), ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![at, dry, blur, headache, neck, note, screen_seconds],
+        "INSERT INTO symptom_records(at, at_ms, dry, blur, headache, neck, note, screen_seconds) \
+         VALUES(COALESCE(?1, datetime('now','localtime')), \
+                COALESCE(?2, CAST(strftime('%s', ?1, 'utc') AS INTEGER) * 1000), \
+                ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![at, at_ms, dry, blur, headache, neck, note, screen_seconds],
     )
     .map_err(|e| format!("insert symptom: {e}"))?;
     Ok(conn.last_insert_rowid())
@@ -359,8 +392,8 @@ pub fn insert_symptom(
 pub fn recent_symptoms(conn: &Connection, limit: i64) -> Result<Vec<SymptomRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, at, dry, blur, headache, neck, note, screen_seconds \
-             FROM symptom_records ORDER BY at DESC, id DESC LIMIT ?1",
+            "SELECT id, at, dry, blur, headache, neck, note, screen_seconds, at_ms \
+             FROM symptom_records ORDER BY at_ms DESC, id DESC LIMIT ?1",
         )
         .map_err(|e| format!("prepare recent symptoms: {e}"))?;
     let rows = stmt
@@ -374,6 +407,7 @@ pub fn recent_symptoms(conn: &Connection, limit: i64) -> Result<Vec<SymptomRow>,
                 neck: row.get(5)?,
                 note: row.get(6)?,
                 screen_seconds: row.get(7)?,
+                at_ms: row.get(8)?,
             })
         })
         .map_err(|e| format!("query recent symptoms: {e}"))?;
@@ -730,8 +764,8 @@ mod tests {
     fn fact_inserts_and_queries() {
         let path = temp_path();
         let conn = open(&path).unwrap();
-        insert_reminder_event(&conn, Some("2026-06-16 10:00:00"), "micro", "completed", 1200.0, 20.0, Some("ok")).unwrap();
-        insert_symptom(&conn, Some("2026-06-16 10:00:00"), 3, 2, 1, 0, None, 1200.0).unwrap();
+        insert_reminder_event(&conn, Some("2026-06-16 10:00:00"), None, "micro", "completed", 1200.0, 20.0, Some("ok")).unwrap();
+        insert_symptom(&conn, Some("2026-06-16 10:00:00"), None, 3, 2, 1, 0, None, 1200.0).unwrap();
         assert_eq!(recent_reminder_events(&conn, 10).unwrap().len(), 1);
         let s = recent_symptoms(&conn, 10).unwrap();
         assert_eq!(s.len(), 1);
@@ -772,12 +806,34 @@ mod tests {
     fn prune_drops_old_keeps_recent() {
         let path = temp_path();
         let conn = open(&path).unwrap();
-        insert_reminder_event(&conn, Some("2000-01-01 00:00:00"), "micro", "completed", 0.0, 0.0, None).unwrap();
-        insert_reminder_event(&conn, None, "micro", "completed", 0.0, 0.0, None).unwrap();
+        insert_reminder_event(&conn, Some("2000-01-01 00:00:00"), None, "micro", "completed", 0.0, 0.0, None).unwrap();
+        insert_reminder_event(&conn, None, None, "micro", "completed", 0.0, 0.0, None).unwrap();
         add_hourly_seconds(&conn, "2000-01-01", 9, 100.0).unwrap();
         prune_old(&conn, 90).unwrap();
         assert_eq!(recent_reminder_events(&conn, 10).unwrap().len(), 1, "ancient event pruned");
         assert!(query_hourly_stats(&conn, "2000-01-01").unwrap().is_empty(), "ancient hourly pruned");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn at_ms_set_on_live_and_backfilled_on_legacy() {
+        let path = temp_path();
+        let conn = open(&path).unwrap();
+        // Live path: an explicit UTC epoch is stored verbatim.
+        insert_reminder_event(&conn, None, Some(1_700_000_000_000), "micro", "completed", 0.0, 0.0, None).unwrap();
+        // Legacy path: a local `at` string is converted to a UTC epoch (best-effort).
+        insert_reminder_event(&conn, Some("2026-06-16 10:00:00"), None, "deep", "completed", 0.0, 0.0, None).unwrap();
+        insert_symptom(&conn, Some("2026-06-16 10:00:00"), None, 1, 0, 0, 0, None, 0.0).unwrap();
+
+        let rows = recent_reminder_events(&conn, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.at_ms.is_some()), "every reminder row has at_ms");
+        assert!(rows.iter().any(|r| r.at_ms == Some(1_700_000_000_000)), "live epoch stored verbatim");
+
+        let syms = recent_symptoms(&conn, 10).unwrap();
+        assert_eq!(syms.len(), 1);
+        assert!(syms[0].at_ms.is_some(), "symptom at_ms back-filled from legacy string");
         drop(conn);
         cleanup(&path);
     }

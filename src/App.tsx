@@ -79,6 +79,7 @@ type ActivitySnapshot = {
 type ReminderLog = {
   id: string;
   at: string;
+  atMs: number | null;
   kind: ReminderKind;
   result: ReminderResult;
   activeSeconds: number;
@@ -88,6 +89,7 @@ type ReminderLog = {
 type SymptomRecord = {
   id: string;
   at: string;
+  atMs: number | null;
   scores: Record<SymptomKind, number>;
   note: string;
   screenSeconds: number;
@@ -341,6 +343,7 @@ type LiveState = {
 type DbReminderRow = {
   id: number;
   at: string;
+  atMs: number | null;
   kind: string;
   result: string;
   activeSeconds: number;
@@ -351,6 +354,7 @@ type DbReminderRow = {
 type DbSymptomRow = {
   id: number;
   at: string;
+  atMs: number | null;
   dry: number;
   blur: number;
   headache: number;
@@ -385,6 +389,7 @@ function dbToLog(row: DbReminderRow): ReminderLog {
   return {
     id: String(row.id),
     at: row.at,
+    atMs: row.atMs,
     kind: row.kind === "deep" ? "deep" : "micro",
     result: row.result as ReminderResult,
     activeSeconds: row.activeSeconds,
@@ -396,6 +401,7 @@ function dbToSymptom(row: DbSymptomRow): SymptomRecord {
   return {
     id: String(row.id),
     at: row.at,
+    atMs: row.atMs,
     scores: { dry: row.dry, blur: row.blur, headache: row.headache, neck: row.neck },
     note: row.note ?? "",
     screenSeconds: row.screenSeconds
@@ -952,10 +958,24 @@ function Overview(props: {
   let microCount = 0;
   let deepCount = 0;
   for (const log of props.data.logs) {
-    if (log.result !== "completed" || !log.at || log.at.slice(0, 10) !== todayIso) continue;
-    const h = parseInt(log.at.slice(11, 13), 10);
-    const m = parseInt(log.at.slice(14, 16), 10);
-    if (h < 0 || h >= 24) continue;
+    if (log.result !== "completed") continue;
+    // Prefer the timezone-safe UTC epoch; fall back to the legacy local-time string.
+    let dateStr: string;
+    let h: number;
+    let m: number;
+    if (typeof log.atMs === "number") {
+      const d = new Date(log.atMs);
+      dateStr = localIsoDate(d);
+      h = d.getHours();
+      m = d.getMinutes();
+    } else if (log.at) {
+      dateStr = log.at.slice(0, 10);
+      h = parseInt(log.at.slice(11, 13), 10);
+      m = parseInt(log.at.slice(14, 16), 10);
+    } else {
+      continue;
+    }
+    if (dateStr !== todayIso || h < 0 || h >= 24) continue;
     const kind: "micro" | "deep" = log.kind === "deep" ? "deep" : "micro";
     restsByHour[h].push({ minute: Number.isFinite(m) ? clamp(m, 0, 59) : 0, kind });
     if (kind === "deep") deepCount += 1;
@@ -1684,6 +1704,7 @@ function Symptoms(props: {
     const nextRecord: SymptomRecord = {
       id: crypto.randomUUID(),
       at: new Date().toISOString(),
+      atMs: Date.now(),
       scores,
       note: "",
       screenSeconds: props.data.today.screenSeconds
