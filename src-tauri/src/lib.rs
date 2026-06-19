@@ -311,6 +311,7 @@ fn db_add_symptom(
     blur: i64,
     headache: i64,
     neck: i64,
+    redness: i64,
     note: Option<String>,
     screen_seconds: f64,
 ) -> Result<i64, String> {
@@ -323,6 +324,7 @@ fn db_add_symptom(
         blur,
         headache,
         neck,
+        redness,
         note.as_deref(),
         screen_seconds,
     )
@@ -1359,6 +1361,7 @@ fn import_legacy_json<R: Runtime>(app: &AppHandle<R>) {
             symptom.scores.blur,
             symptom.scores.headache,
             symptom.scores.neck,
+            0, // legacy data predates the redness dimension
             non_empty(&symptom.note),
             symptom.screen_seconds,
         );

@@ -17,7 +17,7 @@ use rusqlite::{params, Connection, Transaction};
 
 /// Bump this when adding a migration below. The chain runs from the DB's current
 /// version up to here, one transaction per step.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Managed Tauri state: the single owned connection behind a mutex (rusqlite's
 /// `Connection` is not `Sync`).
@@ -129,6 +129,7 @@ fn apply_migration(tx: &Transaction, version: i64) -> Result<(), String> {
         4 => MIGRATION_V4,
         5 => MIGRATION_V5,
         6 => MIGRATION_V6,
+        7 => MIGRATION_V7,
         other => return Err(format!("no migration defined for schema v{other}")),
     };
     tx.execute_batch(sql)
@@ -306,6 +307,12 @@ const MIGRATION_V6: &str = "
     ALTER TABLE activity_sessions ADD COLUMN is_fullscreen INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE activity_sessions ADD COLUMN reason TEXT;
     ALTER TABLE activity_sessions ADD COLUMN timezone_offset_minutes INTEGER;
+";
+
+/// V7 — add the `redness`（眼睛红血丝）symptom dimension. Over-use most commonly shows
+/// as visible eye redness, so it joins dry/blur/headache/neck as a first-class score.
+const MIGRATION_V7: &str = "
+    ALTER TABLE symptom_records ADD COLUMN redness INTEGER NOT NULL DEFAULT 0;
 ";
 
 // ---- Settings access -------------------------------------------------------
@@ -634,6 +641,9 @@ pub struct SymptomRow {
     /// UTC epoch milliseconds (timezone-safe); `None` only for un-back-fillable rows.
     pub at_ms: Option<i64>,
     pub timezone_offset_minutes: Option<i64>,
+    /// 眼睛红血丝 0–5（V7）。`#[serde(default)]` keeps pre-V7 exports importable.
+    #[serde(default)]
+    pub redness: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -645,15 +655,16 @@ pub fn insert_symptom(
     blur: i64,
     headache: i64,
     neck: i64,
+    redness: i64,
     note: Option<&str>,
     screen_seconds: f64,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO symptom_records(at, at_ms, dry, blur, headache, neck, note, screen_seconds, \
-            timezone_offset_minutes) \
+        "INSERT INTO symptom_records(at, at_ms, dry, blur, headache, neck, redness, note, \
+            screen_seconds, timezone_offset_minutes) \
          VALUES(COALESCE(?1, datetime('now','localtime')), \
                 COALESCE(?2, CAST(strftime('%s', ?1, 'utc') AS INTEGER) * 1000), \
-                ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             at,
             at_ms,
@@ -661,6 +672,7 @@ pub fn insert_symptom(
             blur,
             headache,
             neck,
+            redness,
             note,
             screen_seconds,
             timezone_offset_minutes(conn)
@@ -674,7 +686,7 @@ pub fn recent_symptoms(conn: &Connection, limit: i64) -> Result<Vec<SymptomRow>,
     let mut stmt = conn
         .prepare(
             "SELECT id, at, dry, blur, headache, neck, note, screen_seconds, at_ms, \
-                    timezone_offset_minutes \
+                    timezone_offset_minutes, redness \
              FROM symptom_records ORDER BY at_ms DESC, id DESC LIMIT ?1",
         )
         .map_err(|e| format!("prepare recent symptoms: {e}"))?;
@@ -691,6 +703,7 @@ pub fn recent_symptoms(conn: &Connection, limit: i64) -> Result<Vec<SymptomRow>,
                 screen_seconds: row.get(7)?,
                 at_ms: row.get(8)?,
                 timezone_offset_minutes: row.get(9)?,
+                redness: row.get(10)?,
             })
         })
         .map_err(|e| format!("query recent symptoms: {e}"))?;
@@ -1275,10 +1288,10 @@ pub fn import_json(conn: &mut Connection, json: &str) -> Result<ImportSummary, S
         for r in rows {
             s.symptoms += tx
                 .execute(
-                    "INSERT INTO symptom_records(at, at_ms, dry, blur, headache, neck, note, screen_seconds, timezone_offset_minutes) \
-                     SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9 \
+                    "INSERT INTO symptom_records(at, at_ms, dry, blur, headache, neck, note, screen_seconds, timezone_offset_minutes, redness) \
+                     SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 \
                      WHERE NOT EXISTS(SELECT 1 FROM symptom_records WHERE at_ms IS ?2 AND dry=?3 AND blur=?4 AND headache=?5 AND neck=?6)",
-                    params![r.at, r.at_ms, r.dry, r.blur, r.headache, r.neck, r.note, r.screen_seconds, r.timezone_offset_minutes],
+                    params![r.at, r.at_ms, r.dry, r.blur, r.headache, r.neck, r.note, r.screen_seconds, r.timezone_offset_minutes, r.redness],
                 )
                 .map_err(|e| format!("import symptom: {e}"))? as i64;
         }
@@ -1393,7 +1406,7 @@ mod tests {
         let path = temp_path();
         let conn = open(&path).unwrap();
         insert_reminder_event(&conn, Some("2026-06-16 10:00:00"), None, "micro", "completed", 1200.0, 20.0, Some("ok")).unwrap();
-        insert_symptom(&conn, Some("2026-06-16 10:00:00"), None, 3, 2, 1, 0, None, 1200.0).unwrap();
+        insert_symptom(&conn, Some("2026-06-16 10:00:00"), None, 3, 2, 1, 0, 0, None, 1200.0).unwrap();
         assert_eq!(recent_reminder_events(&conn, 10).unwrap().len(), 1);
         let s = recent_symptoms(&conn, 10).unwrap();
         assert_eq!(s.len(), 1);
@@ -1452,7 +1465,7 @@ mod tests {
         insert_reminder_event(&conn, None, Some(1_700_000_000_000), "micro", "completed", 0.0, 0.0, None).unwrap();
         // Legacy path: a local `at` string is converted to a UTC epoch (best-effort).
         insert_reminder_event(&conn, Some("2026-06-16 10:00:00"), None, "deep", "completed", 0.0, 0.0, None).unwrap();
-        insert_symptom(&conn, Some("2026-06-16 10:00:00"), None, 1, 0, 0, 0, None, 0.0).unwrap();
+        insert_symptom(&conn, Some("2026-06-16 10:00:00"), None, 1, 0, 0, 0, 0, None, 0.0).unwrap();
 
         let rows = recent_reminder_events(&conn, 10).unwrap();
         assert_eq!(rows.len(), 2);
@@ -1545,7 +1558,7 @@ mod tests {
         let src = temp_path();
         let conn = open(&src).unwrap();
         insert_reminder_event(&conn, None, Some(1000), "micro", "completed", 100.0, 20.0, Some("x")).unwrap();
-        insert_symptom(&conn, None, Some(2000), 3, 2, 1, 0, None, 1200.0).unwrap();
+        insert_symptom(&conn, None, Some(2000), 3, 2, 1, 0, 0, None, 1200.0).unwrap();
         upsert_daily_stats(&conn, &agg("2026-06-19", 40)).unwrap();
         add_hourly_seconds(&conn, "2026-06-19", 14, 100.0).unwrap();
         let uid = open_reminder_session(&conn, "micro", "auto", Some(900), 1000, 20, Some(24), 100.0).unwrap();

@@ -2,7 +2,7 @@ export type ViewId = "overview" | "reminders" | "trends" | "symptoms" | "setting
 export type ModeId = "conservative" | "balanced" | "intense";
 export type ReminderKind = "micro" | "deep";
 export type ReminderResult = "completed" | "partial" | "postponed" | "skipped" | "deferred";
-export type SymptomKind = "dry" | "blur" | "headache" | "neck";
+export type SymptomKind = "dry" | "blur" | "headache" | "neck" | "redness";
 
 export type ModePreset = {
   id: ModeId;
@@ -134,6 +134,7 @@ export type DbSymptomRow = {
   blur: number;
   headache: number;
   neck: number;
+  redness: number;
   note: string | null;
   screenSeconds: number;
 };
@@ -311,7 +312,7 @@ export function dbToSymptom(row: DbSymptomRow): SymptomRecord {
     id: String(row.id),
     at: row.at,
     atMs: row.atMs,
-    scores: { dry: row.dry, blur: row.blur, headache: row.headache, neck: row.neck },
+    scores: { dry: row.dry, blur: row.blur, headache: row.headache, neck: row.neck, redness: row.redness },
     note: row.note ?? "",
     screenSeconds: row.screenSeconds
   };

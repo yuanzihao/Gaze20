@@ -179,6 +179,7 @@ function MainApp() {
           blur: s.scores.blur,
           headache: s.scores.headache,
           neck: s.scores.neck,
+          redness: s.scores.redness,
           note: s.note,
           screenSeconds: s.screenSeconds
         });
@@ -1122,21 +1123,23 @@ function TrendStatsPage(props: { data: PersistedData; onExport: () => void }) {
   });
 
   // Symptom trend: per-day averages of each dimension over the day axis.
-  const syColors = ["#2caa7e", "#5b8def", "#eaa13a", "#c07ef0"];
-  const syLabels = ["干涩", "模糊", "头痛", "颈肩"];
+  const syColors = ["#2caa7e", "#5b8def", "#eaa13a", "#c07ef0", "#e26d6d"];
+  const syLabels = ["干涩", "模糊", "头痛", "颈肩", "红血丝"];
   const syData = useMemo(() => {
-    const byDay = new Map<string, { v: [number, number, number, number]; n: number }>();
+    type Vec5 = [number, number, number, number, number];
+    const byDay = new Map<string, { v: Vec5; n: number }>();
     for (const r of symptoms) {
       const key = (r.at || "").slice(0, 10);
-      const e = byDay.get(key) ?? { v: [0, 0, 0, 0] as [number, number, number, number], n: 0 };
+      const e = byDay.get(key) ?? { v: [0, 0, 0, 0, 0] as Vec5, n: 0 };
       e.v[0] += r.scores.dry;
       e.v[1] += r.scores.blur;
       e.v[2] += r.scores.headache;
       e.v[3] += r.scores.neck;
+      e.v[4] += r.scores.redness;
       e.n += 1;
       byDay.set(key, e);
     }
-    return [0, 1, 2, 3].map((dim) =>
+    return [0, 1, 2, 3, 4].map((dim) =>
       series.map((s) => {
         const e = byDay.get(s.date);
         return e && e.n > 0 ? e.v[dim] / e.n : 0;
@@ -1418,14 +1421,16 @@ const symptomMeta: Array<{ key: SymptomKind; label: string; hint: string }> = [
   { key: "dry", label: "眼干 / 异物感", hint: "眼睛发干、刺痛、异物感" },
   { key: "blur", label: "视物模糊", hint: "看字发虚、聚焦变慢" },
   { key: "headache", label: "头痛 / 眼胀", hint: "额头、眼眶或太阳穴不适" },
-  { key: "neck", label: "颈肩酸痛", hint: "脖子、肩背紧张酸痛" }
+  { key: "neck", label: "颈肩酸痛", hint: "脖子、肩背紧张酸痛" },
+  { key: "redness", label: "眼睛红血丝", hint: "眼白发红、布满红血丝（用眼过度最常见）" }
 ];
 
 const emptySymptomScores = (): Record<SymptomKind, number> => ({
   dry: 0,
   blur: 0,
   headache: 0,
-  neck: 0
+  neck: 0,
+  redness: 0
 });
 
 function Symptoms(props: {
@@ -1472,10 +1477,11 @@ function Symptoms(props: {
     { key: "dry", label: "眼睛干涩", emoji: "👁" },
     { key: "blur", label: "视物模糊", emoji: "🌫" },
     { key: "headache", label: "头痛不适", emoji: "🤕" },
-    { key: "neck", label: "颈肩酸痛", emoji: "💆" }
+    { key: "neck", label: "颈肩酸痛", emoji: "💆" },
+    { key: "redness", label: "眼睛红血丝", emoji: "🩸" }
   ];
-  const symColors: Record<SymptomKind, string> = { dry: "#2caa7e", blur: "#5b8def", headache: "#eaa13a", neck: "#c07ef0" };
-  const symTrack: Record<SymptomKind, string> = { dry: "#e6f6ee", blur: "#e8f0ff", headache: "#fff1de", neck: "#f3e8ff" };
+  const symColors: Record<SymptomKind, string> = { dry: "#2caa7e", blur: "#5b8def", headache: "#eaa13a", neck: "#c07ef0", redness: "#e26d6d" };
+  const symTrack: Record<SymptomKind, string> = { dry: "#e6f6ee", blur: "#e8f0ff", headache: "#fff1de", neck: "#f3e8ff", redness: "#fdeaea" };
   const recent = records.slice(0, 6);
   const dateLabel = (iso: string) => {
     const d = iso.slice(0, 10);
