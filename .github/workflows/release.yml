@@ -1,0 +1,105 @@
+name: Release Gaze20
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Resolve release version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          if ($tag -notmatch '^v\d+\.\d+\.\d+') {
+            throw "Release tag must look like v0.2.0. Got: $tag"
+          }
+          $version = $tag -replace '^v', ''
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Windows packaging tools
+        shell: pwsh
+        run: |
+          choco install nsis wixtoolset --yes --no-progress
+          $nsisPath = Join-Path ${env:ProgramFiles(x86)} "NSIS"
+          if (Test-Path $nsisPath) {
+            $nsisPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+          $wixRoot = Get-ChildItem ${env:ProgramFiles(x86)} -Directory -Filter "WiX Toolset*" |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+          if ($wixRoot) {
+            Join-Path $wixRoot.FullName "bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri release
+        run: npm run tauri build
+
+      - name: Create portable package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $portableName = "Gaze20_${version}_portable_x64"
+          $portableDir = Join-Path "artifacts" $portableName
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+
+          Copy-Item "src-tauri/target/release/gaze20.exe" -Destination $portableDir
+          Copy-Item "README.md" -Destination $portableDir -ErrorAction SilentlyContinue
+          Copy-Item "LICENSE" -Destination $portableDir -ErrorAction SilentlyContinue
+
+          Compress-Archive -Path (Join-Path $portableDir "*") -DestinationPath "artifacts/${portableName}.zip" -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Gaze20 ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            src-tauri/target/release/bundle/nsis/*setup.exe
+            src-tauri/target/release/bundle/msi/*.msi
+            artifacts/Gaze20_${{ steps.version.outputs.version }}_portable_x64.zip
