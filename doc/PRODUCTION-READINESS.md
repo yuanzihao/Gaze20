@@ -6,15 +6,16 @@
 
 ## 数据层 · 已强化（地基）
 
-数据层已按「专业工具」标准打牢，要点（均带单测，21 个数据库/引擎单测）：
+数据层已按「专业工具」标准打牢，要点（均带单测，22 个数据库/引擎单测）：
 
-- ✅ **本地 SQLite 系统**：迁移链（现 `SCHEMA_VERSION = 5`）、事实表 + 聚合表分层、迁移前自动备份、损坏自动恢复、保留期裁剪、隐私不存窗口标题。
+- ✅ **本地 SQLite 系统**：迁移链（现 `SCHEMA_VERSION = 6`）、事实表 + 聚合表分层、迁移前自动备份、损坏自动恢复、保留期裁剪、隐私不存窗口标题。
 - ✅ **状态机在 Rust**：重启不丢当天进度。
 - ✅ **P0-1 原始活动事实层（V5）**：`activity_sessions` 真正写入——每段「同进程 + 同活动档位」的连续有效用眼一行（`started_ms/ended_ms` UTC 毫秒、`state` active/reading/meeting、`process`、本地 `date/hour`）。解锁 per-app 分析、用眼构成、回溯重算。
 - ✅ **P0-2 时间戳标准化（V4）**：事实表加 `at_ms`（UTC 毫秒）双写 + 回填；查询/前端按 epoch，跨时区/DST 安全。
 - ✅ **P0-3 升级健壮性**：`Engine` 容器级 `#[serde(default)]`（加字段不再反序列化失败）；`streak_days` 冗余存 settings，blob 损坏时可恢复。
 - ✅ **P1 per-app 用眼统计 + 用眼构成**：`db_app_usage` / `db_state_breakdown`，趋势页两张卡。
 - ✅ **P1-2 导出补全 + 导入**：`export_json` 含 daily/hourly/reminder/symptom/activity + 格式版本；`import_json` 单事务、幂等去重合并（不覆盖本机数据）；设置页导出全部 / 导入。
+- ✅ **V6 产品级数据上下文**：每日聚合保存风险模型版本与构成快照，提醒增加 `reminder_sessions` 生命周期表，小时/提醒/症状/活动补齐本地时区与触发上下文。
 - ✅ **P2-6 保留天数可配**：设置页 30/90/180/365 天，重启生效。
 - ✅ **streak 自增**（曾经的坏功能已修，跨天按达标 + 连续自增）。
 - ✅ **退出 flush**：托盘退出前持久化引擎 + 落地当日聚合。
@@ -47,9 +48,9 @@
 - **现状**：`远眺 Gaze20.html`(26MB) 与 `eyes-redness-score-image/*.png`(~15MB) 已 untrack + `.gitignore`，但仍在历史提交里。
 - **改法**：**首次推远端前**用 `git filter-repo` 重写历史抠掉，否则远端永久背着。
 
-### CSP 关着
-- **位置**：`src-tauri/tauri.conf.json` `security.csp: null`。
-- **改法**：设严格 CSP（`'self'` + 本地化字体），纵深防御。
+### CSP 已收紧
+- **现状**：`src-tauri/tauri.conf.json` 已启用 CSP，限制默认来源、IPC 连接、图片/样式/脚本来源，并禁止 object/base/frame 嵌入。
+- **后续**：如果将来把 `overlay.html` 的内联脚本迁到独立文件，可继续移除 `script-src 'unsafe-inline'`。
 
 ### lint / format
 - **现状**：CI 已跑 `cargo test` + `clippy -D warnings` + `tsc`。前端无 eslint/prettier。

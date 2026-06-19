@@ -41,7 +41,6 @@ mod native_reminder {
 #[serde(rename_all = "camelCase")]
 struct ActivitySnapshot {
     idle_seconds: f64,
-    foreground_title: String,
     foreground_process: String,
     is_fullscreen: bool,
     input_active: bool,
@@ -114,9 +113,19 @@ fn show_reminder_overlay<R: Runtime + 'static>(
 }
 
 #[tauri::command]
-fn overlay_action<R: Runtime>(app: AppHandle<R>, action: String) -> Result<(), String> {
+fn overlay_action<R: Runtime>(
+    app: AppHandle<R>,
+    action: String,
+    elapsed_seconds: Option<f64>,
+) -> Result<(), String> {
     close_overlay_windows(&app);
-    app.emit("overlay-action", action)
+    app.emit(
+        "overlay-action",
+        OverlayActionPayload {
+            action,
+            elapsed_seconds,
+        },
+    )
         .map_err(|error| error.to_string())
 }
 
@@ -124,6 +133,20 @@ fn overlay_action<R: Runtime>(app: AppHandle<R>, action: String) -> Result<(), S
 fn overlay_start<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     // Broadcast so every monitor's card starts its countdown in sync.
     app.emit("overlay-start", ()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn overlay_ready<R: Runtime>(app: AppHandle<R>, label: String) -> Result<(), String> {
+    if !label.starts_with("reminder-overlay-") {
+        return Err("invalid overlay label".into());
+    }
+    let Some(window) = app.get_webview_window(&label) else {
+        return Err("overlay window not found".into());
+    };
+    let _ = window.show();
+    let _ = window.set_always_on_top(true);
+    let _ = window.set_focus();
+    Ok(())
 }
 
 #[tauri::command]
@@ -141,15 +164,28 @@ fn close_overlay_windows<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// Where a single overlay card should sit (physical pixels) and how big it is
-/// (logical units, for the WebView's inner size).
+/// Where a single overlay card should sit in logical pixels.
 struct OverlayPlacement {
+    logical_x: f64,
+    logical_y: f64,
     logical_w: f64,
     logical_h: f64,
-    phys_x: i32,
-    phys_y: i32,
-    phys_w: i32,
-    phys_h: i32,
+}
+
+fn overlay_init_script(
+    label: &str,
+    kind_value: &str,
+    seconds: u32,
+    image_index: u8,
+    score: u32,
+    focus_minutes: i64,
+) -> String {
+    let label_json = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".into());
+    let kind_json = serde_json::to_string(kind_value).unwrap_or_else(|_| "\"micro\"".into());
+    format!(
+        "window.__GAZE20_OVERLAY__ = {{ label: {label_json}, kind: {kind_json}, seconds: {seconds}, \
+         imageIndex: {image_index}, score: {score}, focusMinutes: {focus_minutes} }};"
+    )
 }
 
 /// Build one small, opaque, centered reminder card per monitor and return how many
@@ -165,10 +201,6 @@ fn build_overlay_windows<R: Runtime + 'static>(
     focus_minutes: i64,
 ) -> u32 {
     let kind_value = if kind == "deep" { "deep" } else { "micro" };
-    let init_script = format!(
-        "window.__GAZE20_OVERLAY__ = {{ kind: \"{kind_value}\", seconds: {seconds}, \
-         imageIndex: {image_index}, score: {score}, focusMinutes: {focus_minutes} }};"
-    );
     let session = now_ms();
     let monitors = app.available_monitors().unwrap_or_default();
     let mut created = 0u32;
@@ -176,6 +208,8 @@ fn build_overlay_windows<R: Runtime + 'static>(
     if monitors.is_empty() {
         // Headless fallback: let Tauri center one card on the primary monitor.
         let label = format!("reminder-overlay-{session}-0");
+        let init_script =
+            overlay_init_script(&label, kind_value, seconds, image_index, score, focus_minutes);
         if build_one_overlay(app, &label, &init_script, None).is_ok() {
             created += 1;
         }
@@ -189,19 +223,17 @@ fn build_overlay_windows<R: Runtime + 'static>(
         // Compact card; clamp so it never overflows tiny displays.
         let card_w = 420.0_f64.min(mw_logical - 32.0).max(300.0);
         let card_h = 560.0_f64.min(mh_logical - 40.0).max(380.0);
-        let phys_w = (card_w * scale).round() as i32;
-        let phys_h = (card_h * scale).round() as i32;
-        let center_x = m.position().x + (m.size().width as i32) / 2;
-        let center_y = m.position().y + (m.size().height as i32) / 2;
+        let monitor_x = m.position().x as f64 / scale;
+        let monitor_y = m.position().y as f64 / scale;
         let placement = OverlayPlacement {
+            logical_x: monitor_x + (mw_logical - card_w) / 2.0,
+            logical_y: monitor_y + (mh_logical - card_h) / 2.0,
             logical_w: card_w,
             logical_h: card_h,
-            phys_x: center_x - phys_w / 2,
-            phys_y: center_y - phys_h / 2,
-            phys_w,
-            phys_h,
         };
         let label = format!("reminder-overlay-{session}-{i}");
+        let init_script =
+            overlay_init_script(&label, kind_value, seconds, image_index, score, focus_minutes);
         if build_one_overlay(app, &label, &init_script, Some(placement)).is_ok() {
             created += 1;
         }
@@ -222,8 +254,9 @@ fn build_one_overlay<R: Runtime + 'static>(
     let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("overlay.html".into()))
         .title("远眺提醒")
         .inner_size(logical_w, logical_h)
+        .visible(false)
         .decorations(false)
-        .transparent(false)
+        .transparent(true)
         .shadow(true)
         .always_on_top(true)
         .skip_taskbar(true)
@@ -232,23 +265,14 @@ fn build_one_overlay<R: Runtime + 'static>(
         .minimizable(false)
         .focused(true)
         .initialization_script(init_script);
-    if placement.is_none() {
+    if let Some(p) = placement {
+        // The builder APIs use logical pixels. Keeping size and position in the
+        // same coordinate space avoids warped cards on mixed-DPI monitors.
+        builder = builder.position(p.logical_x, p.logical_y);
+    } else {
         builder = builder.center();
     }
-    let window = builder.build().map_err(|error| error.to_string())?;
-    if let Some(p) = placement {
-        // Pin exact physical geometry per monitor; repeat after show() because some
-        // WebView2 builds re-center on first paint.
-        let size = tauri::PhysicalSize::new(p.phys_w.max(1) as u32, p.phys_h.max(1) as u32);
-        let pos = tauri::PhysicalPosition::new(p.phys_x, p.phys_y);
-        let _ = window.set_size(size);
-        let _ = window.set_position(pos);
-        let _ = window.show();
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_focus();
-        let _ = window.set_size(size);
-        let _ = window.set_position(pos);
-    }
+    let _window = builder.build().map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -423,10 +447,16 @@ struct ReminderMeta {
     focus_minutes: Option<i64>,
 }
 
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayActionPayload {
+    action: String,
+    elapsed_seconds: Option<f64>,
+}
+
 fn fallback_snapshot() -> ActivitySnapshot {
     ActivitySnapshot {
         idle_seconds: 0.0,
-        foreground_title: String::new(),
         foreground_process: String::new(),
         is_fullscreen: false,
         input_active: false,
@@ -728,10 +758,28 @@ fn load_engine<R: Runtime>(app: &AppHandle<R>) -> engine::Engine {
 
 /// Resolve a finished reminder (button or countdown timeout) into the engine and
 /// record the fact. Idempotent: a duplicate `overlay-action` resolves to `None`.
+fn parse_overlay_action(payload: &str) -> Option<OverlayActionPayload> {
+    if let Ok(parsed) = serde_json::from_str::<OverlayActionPayload>(payload) {
+        return Some(parsed);
+    }
+    if let Ok(action) = serde_json::from_str::<String>(payload) {
+        return Some(OverlayActionPayload {
+            action,
+            elapsed_seconds: None,
+        });
+    }
+    let action = payload.trim_matches('"').to_string();
+    (!action.is_empty()).then_some(OverlayActionPayload {
+        action,
+        elapsed_seconds: None,
+    })
+}
+
 fn handle_overlay_action<R: Runtime>(app: &AppHandle<R>, payload: &str) {
-    let action = serde_json::from_str::<String>(payload)
-        .unwrap_or_else(|_| payload.trim_matches('"').to_string());
-    let result = match action.as_str() {
+    let Some(payload) = parse_overlay_action(payload) else {
+        return;
+    };
+    let result = match payload.action.as_str() {
         "complete" => engine::Reminder::Completed,
         "postpone" => engine::Reminder::Postponed,
         "skip" => engine::Reminder::Skipped,
@@ -742,7 +790,7 @@ fn handle_overlay_action<R: Runtime>(app: &AppHandle<R>, payload: &str) {
         Some(eh) => {
             let mut e = eh.engine.lock().unwrap_or_else(|p| p.into_inner());
             let active = e.screen_seconds;
-            let outcome = e.resolve(result, now);
+            let outcome = e.resolve(result, now, payload.elapsed_seconds);
             let meta = eh
                 .active_reminder
                 .lock()
@@ -752,19 +800,28 @@ fn handle_overlay_action<R: Runtime>(app: &AppHandle<R>, payload: &str) {
         }
         None => return,
     };
-    if let Some((kind, gaze)) = outcome {
+    if let Some(resolution) = outcome {
         let result_str = match result {
+            engine::Reminder::Completed if !resolution.completed_enough => "partial",
             engine::Reminder::Completed => "completed",
             engine::Reminder::Postponed => "postponed",
             engine::Reminder::Skipped => "skipped",
         };
+        let note = if result_str == "partial" {
+            Some(format!(
+                "提前结束：实际休息 {:.0}/{:.0} 秒",
+                resolution.elapsed_seconds, resolution.target_seconds
+            ))
+        } else {
+            None
+        };
         record_reminder_event(
             app,
-            kind.as_str(),
+            resolution.kind.as_str(),
             result_str,
             active,
-            gaze,
-            None,
+            resolution.gaze_credit,
+            note.as_deref(),
             meta.as_ref(),
             "overlay",
         );
@@ -1557,6 +1614,7 @@ pub fn run() {
             show_reminder_overlay,
             overlay_action,
             overlay_start,
+            overlay_ready,
             get_display_count,
             db_get_settings,
             db_set_setting,
@@ -1601,7 +1659,6 @@ fn platform_activity_snapshot(reading_grace_seconds: u64, away_seconds: u64) -> 
 fn platform_activity_snapshot(_reading_grace_seconds: u64, _away_seconds: u64) -> ActivitySnapshot {
     ActivitySnapshot {
         idle_seconds: 0.0,
-        foreground_title: "Unsupported platform preview".into(),
         foreground_process: "unknown".into(),
         is_fullscreen: false,
         input_active: true,
@@ -1671,6 +1728,9 @@ mod windows_activity {
     use std::path::Path;
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, HWND, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
     use windows::Win32::System::SystemInformation::GetTickCount64;
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
@@ -1678,8 +1738,8 @@ mod windows_activity {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW,
-        GetWindowTextW, GetWindowThreadProcessId, SM_CXSCREEN, SM_CYSCREEN,
+        GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId,
     };
 
     pub fn snapshot(reading_grace_seconds: u64, away_seconds: u64) -> ActivitySnapshot {
@@ -1763,7 +1823,6 @@ mod windows_activity {
 
         ActivitySnapshot {
             idle_seconds,
-            foreground_title: title,
             foreground_process: process,
             is_fullscreen: fullscreen,
             input_active,
@@ -1849,9 +1908,23 @@ mod windows_activity {
         if !ok {
             return false;
         }
-        let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-        let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-        rect.left <= 0 && rect.top <= 0 && rect.right >= screen_w && rect.bottom >= screen_h
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if monitor.is_invalid() {
+            return false;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info).as_bool() } {
+            return false;
+        }
+        let monitor_rect = info.rcMonitor;
+        let tolerance = 2;
+        rect.left <= monitor_rect.left + tolerance
+            && rect.top <= monitor_rect.top + tolerance
+            && rect.right >= monitor_rect.right - tolerance
+            && rect.bottom >= monitor_rect.bottom - tolerance
     }
 
     fn contains_any(value: &str, needles: &[&str]) -> bool {

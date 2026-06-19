@@ -190,7 +190,7 @@
 - **SQLite（rusqlite，bundled）** —— SQLite 编译进二进制，免去系统依赖；WAL 模式 + 显式迁移链保证数据可演进、可恢复。
 - **独立 overlay.html 提醒窗** —— 与主应用解耦的轻量卡片，多屏各一份、物理像素居中、不透明不霸屏。
 
-**数据库表（`SCHEMA_VERSION = 3`）：** `app_meta`、`settings`、`activity_sessions`、`reminder_events`、`symptom_records`、`daily_stats`、`hourly_stats`。
+**数据库表（`SCHEMA_VERSION = 6`）：** `app_meta`、`settings`、`activity_sessions`、`reminder_events`、`reminder_sessions`、`symptom_records`、`daily_stats`、`hourly_stats`。
 
 ---
 
@@ -243,7 +243,7 @@ npm run dev:web
 **运行测试：**
 
 ```bash
-# Rust 单元测试（状态机 8 个 + 数据库 7 个）
+# Rust 单元测试（状态机 + 数据库，共 22 个）
 cargo test --manifest-path src-tauri/Cargo.toml
 
 # 前端类型检查
@@ -275,8 +275,8 @@ CI（`.github/workflows/build.yml`）会在向 `main` 推送 / 提 PR 时，于 
 当前版本（0.2.0）是一个功能完整、可日常使用的版本，但作为面向大众的成熟产品仍有打磨空间。完整的产品化待办见 [`doc/PRODUCTION-READINESS.md`](doc/PRODUCTION-READINESS.md)，要点：
 
 - **未代码签名 / 自动更新未配真实服务端** —— 安装会触发 SmartScreen 警告；更新链路就绪但指向占位地址。
-- **`streak_days`（连续守护天数）尚未自增** —— 跨天逻辑保留但未递增，该指标暂不准确。
 - **症状未纳入风险模型** —— 风险评分目前只用客观用眼数据。
+- **前端仍是单文件主应用** —— `App.tsx` 已承载多页面和数据转换，后续应拆分成页面、hooks 与 Tauri 命令层。
 - **仅支持简体中文、无障碍能力有限** —— 暂无 i18n 与完整键盘导航。
 - **仅 Windows** —— 活动检测依赖 Win32，跨平台需补适配。
 

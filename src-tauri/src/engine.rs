@@ -93,6 +93,15 @@ pub enum Reminder {
     Skipped,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Resolution {
+    pub kind: Kind,
+    pub gaze_credit: f64,
+    pub completed_enough: bool,
+    pub elapsed_seconds: f64,
+    pub target_seconds: f64,
+}
+
 /// What a tick wants the host (lib.rs) to do. Exactly one thing per tick.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Decision {
@@ -291,21 +300,38 @@ impl Engine {
     /// Apply the outcome of the on-screen reminder. Returns the resolved kind and
     /// the gaze-seconds credited (so the host can write the `reminder_events` row),
     /// or `None` if no reminder was active (idempotent against duplicate actions).
-    pub fn resolve(&mut self, result: Reminder, now_ms: u128) -> Option<(Kind, f64)> {
+    pub fn resolve(
+        &mut self,
+        result: Reminder,
+        now_ms: u128,
+        elapsed_seconds: Option<f64>,
+    ) -> Option<Resolution> {
         let kind = self.reminding?;
         let preset = self.mode.preset();
         let mut gaze_credit = 0.0;
+        let target_seconds = match kind {
+            Kind::Micro => preset.break_seconds,
+            Kind::Deep => preset.deep_break_minutes * SECS_PER_MIN,
+        };
+        let elapsed = elapsed_seconds
+            .unwrap_or(target_seconds)
+            .clamp(0.0, target_seconds);
+        let completed_enough = elapsed + 0.5 >= target_seconds * 0.8;
         match result {
             Reminder::Completed => {
                 match kind {
                     Kind::Micro => {
-                        self.micro_done += 1;
-                        gaze_credit = preset.break_seconds;
+                        if completed_enough {
+                            self.micro_done += 1;
+                        }
+                        gaze_credit = elapsed;
                         self.distant_gaze += gaze_credit;
                         self.risk = self.compute_risk(self.continuous, 0.0);
                     }
                     Kind::Deep => {
-                        self.deep_done += 1;
+                        if completed_enough {
+                            self.deep_done += 1;
+                        }
                         self.deep_active = 0.0;
                         self.continuous = 0.0;
                         self.risk = self.compute_risk(0.0, 0.0);
@@ -326,7 +352,13 @@ impl Engine {
             }
         }
         self.reminding = None;
-        Some((kind, gaze_credit))
+        Some(Resolution {
+            kind,
+            gaze_credit,
+            completed_enough,
+            elapsed_seconds: elapsed,
+            target_seconds,
+        })
     }
 
     /// If the wall-clock day changed, hand back the finished day's counters (for the
@@ -448,8 +480,17 @@ mod tests {
                 break;
             }
         }
-        let out = e.resolve(Reminder::Completed, 100_000);
-        assert_eq!(out, Some((Kind::Micro, 20.0))); // micro, break_seconds gaze
+        let out = e.resolve(Reminder::Completed, 100_000, Some(20.0));
+        assert_eq!(
+            out,
+            Some(Resolution {
+                kind: Kind::Micro,
+                gaze_credit: 20.0,
+                completed_enough: true,
+                elapsed_seconds: 20.0,
+                target_seconds: 20.0
+            })
+        ); // micro, break_seconds gaze
         assert_eq!(e.micro_done, 1);
         assert_eq!(e.micro_active, 0.0);
         assert!(e.reminding.is_none());
@@ -457,10 +498,31 @@ mod tests {
     }
 
     #[test]
+    fn early_complete_records_partial_gaze_without_done_credit() {
+        let mut e = balanced();
+        e.reminding = Some(Kind::Micro);
+        e.micro_active = 45.0;
+        let out = e.resolve(Reminder::Completed, 100_000, Some(5.0));
+        assert_eq!(
+            out,
+            Some(Resolution {
+                kind: Kind::Micro,
+                gaze_credit: 5.0,
+                completed_enough: false,
+                elapsed_seconds: 5.0,
+                target_seconds: 20.0
+            })
+        );
+        assert_eq!(e.micro_done, 0);
+        assert_eq!(e.micro_active, 0.0);
+        assert!((e.distant_gaze - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn postpone_sets_snooze_window() {
         let mut e = balanced();
         e.reminding = Some(Kind::Micro);
-        e.resolve(Reminder::Postponed, 1_000_000);
+        e.resolve(Reminder::Postponed, 1_000_000, None);
         assert_eq!(e.postponed, 1);
         assert_eq!(e.snooze_until_ms, 1_000_000 + 5 * 60 * 1000);
     }

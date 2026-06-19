@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default desktop permissions for 远眺 Gaze20",
+  "description": "Minimal frontend permissions for 远眺 Gaze20. App commands stay in Rust; WebViews only need to listen for sync events.",
   "windows": ["main", "reminder-overlay-*"],
-  "permissions": ["core:default", "notification:default"]
+  "permissions": ["core:event:allow-listen"]
 }

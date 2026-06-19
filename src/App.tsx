@@ -36,244 +36,41 @@ import React, {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-
-type ViewId = "overview" | "reminders" | "trends" | "symptoms" | "settings";
-type ModeId = "conservative" | "balanced" | "intense";
-type ReminderKind = "micro" | "deep";
-type ReminderResult = "completed" | "postponed" | "skipped" | "deferred";
-type SymptomKind = "dry" | "blur" | "headache" | "neck";
-
-type ModePreset = {
-  id: ModeId;
-  label: string;
-  sub: string;
-  microMinutes: number;
-  deepMinutes: number;
-  breakSeconds: number;
-  deepBreakMinutes: number;
-};
-
-type Settings = {
-  mode: ModeId;
-  notifications: boolean;
-  doNotDisturb: boolean;
-  autoStart: boolean;
-  readingGraceMinutes: number;
-  awayMinutes: number;
-  debugFastMode: boolean;
-};
-
-type ActivitySnapshot = {
-  idleSeconds: number;
-  foregroundTitle: string;
-  foregroundProcess: string;
-  isFullscreen: boolean;
-  inputActive: boolean;
-  readingActive: boolean;
-  eyeActivityWeight: number;
-  shouldDefer: boolean;
-  reason: string;
-  capturedAtMs: number;
-};
-
-type ReminderLog = {
-  id: string;
-  at: string;
-  atMs: number | null;
-  kind: ReminderKind;
-  result: ReminderResult;
-  activeSeconds: number;
-  note: string;
-};
-
-type SymptomRecord = {
-  id: string;
-  at: string;
-  atMs: number | null;
-  scores: Record<SymptomKind, number>;
-  note: string;
-  screenSeconds: number;
-};
-
-type DayStats = {
-  date: string;
-  screenSeconds: number;
-  distantGazeSeconds: number;
-  microDue: number;
-  microDone: number;
-  deepDue: number;
-  deepDone: number;
-  skipped: number;
-  postponed: number;
-  deferred: number;
-  riskScore: number;
-};
-
-type PersistedData = {
-  version: number;
-  settings: Settings;
-  today: DayStats;
-  logs: ReminderLog[];
-  symptoms: SymptomRecord[];
-  streakDays: number;
-};
-
-const presets: ModePreset[] = [
-  {
-    id: "conservative",
-    label: "保守",
-    sub: "会议多，尽量少打扰",
-    microMinutes: 30,
-    deepMinutes: 90,
-    breakSeconds: 20,
-    deepBreakMinutes: 3
-  },
-  {
-    id: "balanced",
-    label: "平衡",
-    sub: "默认推荐，提醒适中",
-    microMinutes: 20,
-    deepMinutes: 60,
-    breakSeconds: 20,
-    deepBreakMinutes: 3
-  },
-  {
-    id: "intense",
-    label: "激进",
-    sub: "干涩明显，强化休息",
-    microMinutes: 15,
-    deepMinutes: 45,
-    breakSeconds: 30,
-    deepBreakMinutes: 5
-  }
-];
-
-const defaultSettings: Settings = {
-  mode: "balanced",
-  notifications: true,
-  doNotDisturb: false,
-  autoStart: false,
-  readingGraceMinutes: 8,
-  awayMinutes: 12,
-  debugFastMode: false
-};
-
-const todayKey = () => new Date().toISOString().slice(0, 10);
-
-function emptyStats(): DayStats {
-  return {
-    date: todayKey(),
-    screenSeconds: 0,
-    distantGazeSeconds: 0,
-    microDue: 0,
-    microDone: 0,
-    deepDue: 0,
-    deepDone: 0,
-    skipped: 0,
-    postponed: 0,
-    deferred: 0,
-    riskScore: 18
-  };
-}
-
-function defaultData(): PersistedData {
-  return {
-    version: 3,
-    settings: defaultSettings,
-    today: emptyStats(),
-    logs: [],
-    symptoms: [],
-    streakDays: 1
-  };
-}
-
-function migrateData(parsed: Partial<PersistedData>): PersistedData {
-  const today = parsed.today?.date === todayKey()
-    ? { ...emptyStats(), ...parsed.today, date: todayKey() }
-    : emptyStats();
-
-  return {
-    ...defaultData(),
-    ...parsed,
-    version: 3,
-    settings: { ...defaultSettings, ...(parsed.settings ?? {}) },
-    today,
-    logs: parsed.logs ?? [],
-    symptoms: parsed.symptoms ?? []
-  };
-}
-
-function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value));
-}
-
-function formatDuration(seconds: number, compact = false) {
-  const s = Math.max(0, Math.floor(seconds));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  if (h > 0) return compact ? `${h}h ${m}m` : `${h} 小时 ${m} 分`;
-  if (compact) return `${m}m ${sec}s`;
-  return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
-}
-
-function riskLabel(score: number) {
-  if (score >= 70) return "高";
-  if (score >= 40) return "中";
-  return "低";
-}
-
-function riskTone(score: number) {
-  if (score >= 70) return "danger";
-  if (score >= 40) return "warn";
-  return "ok";
-}
-
-function modeToPreset(mode: ModeId) {
-  return presets.find((item) => item.id === mode) ?? presets[1];
-}
-
-function makeFallbackSnapshot(): ActivitySnapshot {
-  return {
-    idleSeconds: 0,
-    foregroundTitle: "浏览器预览模式",
-    foregroundProcess: "browser-preview",
-    isFullscreen: false,
-    inputActive: true,
-    readingActive: false,
-    eyeActivityWeight: 1,
-    shouldDefer: false,
-    reason: "预览模式：模拟键鼠活跃",
-    capturedAtMs: Date.now()
-  };
-}
-
-function computeRisk(
-  stats: DayStats,
-  continuousSeconds: number,
-  microActiveSeconds: number,
-  preset: ModePreset
-) {
-  const continuousRisk = clamp(continuousSeconds / (90 * 60), 0, 1) * 30;
-  const totalRisk = clamp(stats.screenSeconds / (8 * 3600), 0, 1) * 20;
-  const microDue = Math.max(1, Math.floor(stats.screenSeconds / (preset.microMinutes * 60)));
-  const doneRate = stats.microDone / microDue;
-  const completionRisk = (1 - clamp(doneRate, 0, 1)) * 20;
-  const gazeTarget = Math.max(1, stats.microDone * preset.breakSeconds);
-  const gazeRisk = (1 - clamp(stats.distantGazeSeconds / gazeTarget, 0, 1)) * 10;
-  const pressureRisk = clamp(microActiveSeconds / (preset.microMinutes * 60), 0, 1) * 20;
-  return Math.round(
-    clamp(continuousRisk + totalRisk + completionRisk + gazeRisk + pressureRisk, 0, 100)
-  );
-}
-
-function scoreFromRisk(risk: number) {
-  return clamp(Math.round(100 - risk * 0.72), 18, 100);
-}
-
-function eyeImageIndex(risk: number) {
-  return clamp(Math.round((risk / 100) * 9), 0, 9);
-}
+import {
+  clamp,
+  dbToLog,
+  dbToSymptom,
+  defaultData,
+  eyeImageIndex,
+  formatDuration,
+  liveToSnapshot,
+  localIsoDate,
+  makeFallbackSnapshot,
+  modeToPreset,
+  presets,
+  reminderResultLabel,
+  riskLabel,
+  scoreFromRisk,
+  todayKey
+} from "./domain";
+import type {
+  ActivitySnapshot,
+  DayStats,
+  DbAppUsageRow,
+  DbDailyRow,
+  DbHourlyRow,
+  DbReminderRow,
+  DbStateRow,
+  DbSymptomRow,
+  LiveState,
+  ModeId,
+  ModePreset,
+  PersistedData,
+  ReminderKind,
+  SymptomKind,
+  SymptomRecord,
+  ViewId
+} from "./domain";
 
 async function safeInvoke<T>(cmd: string, args?: Record<string, unknown>) {
   try {
@@ -301,128 +98,6 @@ export default function App() {
   }, []);
 
   return <MainApp />;
-}
-
-// Live state pushed by the Rust engine (camelCase mirrors lib.rs `LiveState`).
-type LiveState = {
-  mode: ModeId;
-  running: boolean;
-  doNotDisturb: boolean;
-  debugFastMode: boolean;
-  readingGraceMinutes: number;
-  awayMinutes: number;
-  date: string;
-  screenSeconds: number;
-  microActive: number;
-  deepActive: number;
-  continuous: number;
-  microDone: number;
-  deepDone: number;
-  microDue: number;
-  deepDue: number;
-  distantGaze: number;
-  postponed: number;
-  skipped: number;
-  deferred: number;
-  risk: number;
-  eyeScore: number;
-  imageIndex: number;
-  streakDays: number;
-  effectiveMicroSeconds: number;
-  effectiveDeepSeconds: number;
-  nextMicroSeconds: number;
-  nextDeepSeconds: number;
-  reminding: string | null;
-  snoozeActive: boolean;
-  reason: string;
-  foregroundProcess: string;
-  shouldDefer: boolean;
-  isFullscreen: boolean;
-};
-
-type DbReminderRow = {
-  id: number;
-  at: string;
-  atMs: number | null;
-  kind: string;
-  result: string;
-  activeSeconds: number;
-  gazeSeconds: number;
-  note: string | null;
-};
-
-type DbSymptomRow = {
-  id: number;
-  at: string;
-  atMs: number | null;
-  dry: number;
-  blur: number;
-  headache: number;
-  neck: number;
-  note: string | null;
-  screenSeconds: number;
-};
-
-type DbDailyRow = {
-  date: string;
-  screenSeconds: number;
-  distantGazeSeconds: number;
-  microDue: number;
-  microDone: number;
-  deepDue: number;
-  deepDone: number;
-  skipped: number;
-  postponed: number;
-  deferred: number;
-  riskScore: number;
-  riskPeak: number;
-};
-
-type DbHourlyRow = { date: string; hour: number; screenSeconds: number };
-type DbAppUsageRow = { process: string | null; activeSeconds: number; sessions: number };
-type DbStateRow = { state: string; activeSeconds: number };
-
-function localIsoDate(d: Date): string {
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-
-function dbToLog(row: DbReminderRow): ReminderLog {
-  return {
-    id: String(row.id),
-    at: row.at,
-    atMs: row.atMs,
-    kind: row.kind === "deep" ? "deep" : "micro",
-    result: row.result as ReminderResult,
-    activeSeconds: row.activeSeconds,
-    note: row.note ?? ""
-  };
-}
-
-function dbToSymptom(row: DbSymptomRow): SymptomRecord {
-  return {
-    id: String(row.id),
-    at: row.at,
-    atMs: row.atMs,
-    scores: { dry: row.dry, blur: row.blur, headache: row.headache, neck: row.neck },
-    note: row.note ?? "",
-    screenSeconds: row.screenSeconds
-  };
-}
-
-function liveToSnapshot(live: LiveState): ActivitySnapshot {
-  return {
-    idleSeconds: 0,
-    foregroundTitle: "",
-    foregroundProcess: live.foregroundProcess,
-    isFullscreen: live.isFullscreen,
-    inputActive: true,
-    readingActive: false,
-    eyeActivityWeight: 1,
-    shouldDefer: live.shouldDefer,
-    reason: live.reason,
-    capturedAtMs: Date.now()
-  };
 }
 
 function MainApp() {
@@ -1253,7 +928,7 @@ function Reminders(props: {
         <div className="log-list">
           {props.data.logs.slice(0, 8).map((log) => (
             <div className="log-row" key={log.id}>
-              <span className={log.result}>{log.result}</span>
+              <span className={log.result}>{reminderResultLabel(log.result)}</span>
               <div>
                 <strong>{log.kind === "micro" ? "远眺提醒" : "深休息"}</strong>
                 <p>{new Date(log.at).toLocaleTimeString()} · {log.note}</p>
@@ -1277,7 +952,7 @@ function Reminders(props: {
         <div className={props.snapshot.shouldDefer ? "defer-state on" : "defer-state"}>
           {props.snapshot.shouldDefer ? <BellOff size={22} /> : <Bell size={22} />}
           <strong>{props.snapshot.shouldDefer ? "当前自动延后" : "可正常提醒"}</strong>
-          <p>{props.snapshot.foregroundProcess || "未知窗口"} · {props.snapshot.foregroundTitle || "无标题"}</p>
+          <p>{props.snapshot.foregroundProcess || "未知进程"} · 不显示窗口标题</p>
         </div>
       </section>
     </div>
@@ -2131,7 +1806,7 @@ function Settings(props: {
         />
       </section>
 
-      <section className="settings-card">
+      <section className="settings-card settings-desktop-card">
         <SectionTitle title="桌面能力" sub="Windows 常驻能力" />
         <Toggle
           label="桌面通知"
@@ -2148,41 +1823,49 @@ function Settings(props: {
           checked={props.data.settings.autoStart}
           onChange={props.onAutoStart}
         />
-        <div className="slider-row" style={{ gridTemplateColumns: "1fr auto", marginTop: 18 }}>
-          <span style={{ fontWeight: 800 }}>
+        <div className="settings-inline-row">
+          <span className="settings-row-copy">
             软件更新
             {updateMsg && (
-              <span style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#6f857c", marginTop: 4 }}>{updateMsg}</span>
+              <span>{updateMsg}</span>
             )}
           </span>
           <button
+            className="settings-pill-button"
             onClick={checkUpdate}
             disabled={checking}
-            style={{ background: "#eef6f2", color: "#1f7a64", border: "none", borderRadius: 12, padding: "9px 16px", fontSize: 13.5, fontWeight: 700, cursor: checking ? "default" : "pointer" }}
           >
             {checking ? "检查中…" : "检查更新"}
           </button>
         </div>
-        <div className="slider-row" style={{ gridTemplateColumns: "1fr auto auto", gap: 8, marginTop: 18, alignItems: "center" }}>
-          <span style={{ fontWeight: 800 }}>
+        <div className="settings-data-row">
+          <span className="settings-row-copy">
             数据导出 / 导入
-            <span style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#6f857c", marginTop: 4 }}>
+            <span>
               {dataMsg ?? "换机/重装可导出备份；导入会合并并跳过重复，不覆盖本机数据。"}
             </span>
           </span>
-          <button onClick={exportAll} style={{ background: "#eef6f2", color: "#1f7a64", border: "none", borderRadius: 12, padding: "9px 16px", fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}>导出全部</button>
-          <button onClick={pickImport} style={{ background: "#eef6f2", color: "#1f7a64", border: "none", borderRadius: 12, padding: "9px 16px", fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}>导入</button>
+          <div className="settings-action-group">
+            <button className="settings-pill-button" onClick={exportAll}>导出全部</button>
+            <button className="settings-pill-button" onClick={pickImport}>导入</button>
+          </div>
         </div>
-        <div className="slider-row" style={{ gridTemplateColumns: "1fr auto", marginTop: 18, alignItems: "center" }}>
-          <span style={{ fontWeight: 800 }}>
+        <div className="settings-retention-row">
+          <span className="settings-row-copy">
             明细数据保留
             <span style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#6f857c", marginTop: 4 }}>超期的逐时段/提醒/活动明细自动清理；每日汇总长期保留。</span>
           </span>
-          <div style={{ display: "flex", gap: 6 }}>
+          <div className="retention-options">
             {[30, 90, 180, 365].map((d) => {
               const on = (retention ?? 90) === d;
               return (
-                <button key={d} onClick={() => setRetentionDays(d)} style={{ background: on ? "linear-gradient(135deg,#3fa98e,#2c8e76)" : "#eef6f2", color: on ? "#fff" : "#1f7a64", border: "none", borderRadius: 10, padding: "8px 12px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{d} 天</button>
+                <button
+                  className={on ? "settings-pill-button active" : "settings-pill-button"}
+                  key={d}
+                  onClick={() => setRetentionDays(d)}
+                >
+                  {d} 天
+                </button>
               );
             })}
           </div>
@@ -2209,14 +1892,14 @@ function Settings(props: {
       <section className="settings-card privacy-card">
         <SectionTitle title="隐私与数据" sub="和你给的网页文案一致，只做本地提醒" />
         <Rule label="摄像头" val="不调用、不采集、不上传画面" />
-        <Rule label="数据位置" val="本机应用数据目录与 localStorage 双备份" />
-        <Rule label="导出方式" val="趋势统计页可导出 JSON，自行留存" />
+        <Rule label="数据位置" val="本机 SQLite 数据库，可手动导出备份" />
+        <Rule label="窗口标题" val="仅用于内存判断，不展示、不落盘" />
+        <Rule label="导出方式" val="设置页可导出 JSON，自行留存" />
       </section>
 
       <section className="activity-card">
         <SectionTitle title="实时检测状态" sub="来自 Rust / Windows API" />
         <Rule label="前台进程" val={props.snapshot.foregroundProcess || "未知"} />
-        <Rule label="窗口标题" val={props.snapshot.foregroundTitle || "无标题"} />
         <Rule label="空闲时间" val={`${Math.round(props.snapshot.idleSeconds)} 秒`} />
         <Rule label="活动权重" val={`${Math.round(props.snapshot.eyeActivityWeight * 100)}%`} />
         <Rule label="判断原因" val={props.snapshot.reason} />

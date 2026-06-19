@@ -275,6 +275,17 @@ button {
   gap: 16px;
 }
 
+.settings-grid {
+  align-items: start;
+}
+
+.settings-grid > .wide-card,
+.settings-grid > .settings-card,
+.settings-grid > .activity-card {
+  min-width: 0;
+  overflow: hidden;
+}
+
 .overview-shell {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 340px;
@@ -786,6 +797,10 @@ button {
   margin-top: 16px;
 }
 
+.settings-grid .mode-grid {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
 .step {
   padding: 16px;
   border-radius: 14px;
@@ -840,6 +855,11 @@ button {
 .log-row > span.deferred {
   color: #7462c7;
   background: #efeaff;
+}
+
+.log-row > span.partial {
+  color: #1f6d5d;
+  background: #e8f6f2;
 }
 
 .log-row strong {
@@ -1828,6 +1848,20 @@ button {
   color: var(--ink);
 }
 
+.settings-card .slider-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 12px;
+}
+
+.settings-card .slider-row input {
+  grid-column: 1 / -1;
+  min-height: 28px;
+}
+
+.settings-card .slider-row span {
+  min-width: 0;
+}
+
 .toggle-row {
   min-height: 44px;
   display: grid;
@@ -1873,6 +1907,85 @@ button {
 
 .toggle-row input:checked + i::after {
   transform: translateX(20px);
+}
+
+.settings-inline-row,
+.settings-data-row,
+.settings-retention-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  margin-top: 18px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.settings-data-row,
+.settings-retention-row {
+  grid-template-columns: 1fr;
+  align-items: start;
+}
+
+.settings-data-row .settings-action-group,
+.settings-retention-row .retention-options {
+  justify-content: flex-start;
+}
+
+.settings-row-copy {
+  min-width: 0;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.settings-row-copy > span {
+  display: block;
+  margin-top: 5px;
+  color: #6f857c;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.settings-action-group,
+.retention-options {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.settings-pill-button {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 12px;
+  padding: 8px 14px;
+  color: #1f7a64;
+  background: #eef6f2;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.settings-pill-button:disabled {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.settings-pill-button.active {
+  color: #fff;
+  background: linear-gradient(135deg, #3fa98e, #2c8e76);
+}
+
+.retention-options .settings-pill-button {
+  min-width: 54px;
 }
 
 .danger-button {
