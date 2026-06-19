@@ -1253,7 +1253,12 @@ pub fn run() {
                     };
                     if let Some(conn) = conn {
                         db::daily_backup(&db_path); // rolling 24h backup
-                        let _ = db::prune_old(&conn, 90); // keep 90d of fine-grained events
+                        // Configurable retention (default 90d); applied at startup.
+                        let retention = db::get_setting(&conn, "retention_days")
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(90)
+                            .clamp(30, 3650);
+                        let _ = db::prune_old(&conn, retention);
                         app.manage(db::Database {
                             conn: std::sync::Mutex::new(conn),
                         });

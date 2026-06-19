@@ -2065,6 +2065,18 @@ function Settings(props: {
     };
     input.click();
   }
+  const [retention, setRetention] = useState<number | null>(null);
+  useEffect(() => {
+    safeInvoke<Record<string, string>>("db_get_settings").then((s) => {
+      const v = parseInt(s?.["retention_days"] ?? "90", 10);
+      setRetention(Number.isFinite(v) ? v : 90);
+    });
+  }, []);
+  function setRetentionDays(v: number) {
+    setRetention(v);
+    safeInvoke("db_set_setting", { key: "retention_days", value: String(v) });
+    setDataMsg(`明细数据保留 ${v} 天（重启后生效）`);
+  }
   return (
     <div className="settings-grid">
       <section className="wide-card">
@@ -2160,6 +2172,20 @@ function Settings(props: {
           </span>
           <button onClick={exportAll} style={{ background: "#eef6f2", color: "#1f7a64", border: "none", borderRadius: 12, padding: "9px 16px", fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}>导出全部</button>
           <button onClick={pickImport} style={{ background: "#eef6f2", color: "#1f7a64", border: "none", borderRadius: 12, padding: "9px 16px", fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}>导入</button>
+        </div>
+        <div className="slider-row" style={{ gridTemplateColumns: "1fr auto", marginTop: 18, alignItems: "center" }}>
+          <span style={{ fontWeight: 800 }}>
+            明细数据保留
+            <span style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#6f857c", marginTop: 4 }}>超期的逐时段/提醒/活动明细自动清理；每日汇总长期保留。</span>
+          </span>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[30, 90, 180, 365].map((d) => {
+              const on = (retention ?? 90) === d;
+              return (
+                <button key={d} onClick={() => setRetentionDays(d)} style={{ background: on ? "linear-gradient(135deg,#3fa98e,#2c8e76)" : "#eef6f2", color: on ? "#fff" : "#1f7a64", border: "none", borderRadius: 10, padding: "8px 12px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>{d} 天</button>
+              );
+            })}
+          </div>
         </div>
       </section>
 
