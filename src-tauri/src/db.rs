@@ -17,7 +17,7 @@ use rusqlite::{params, Connection, Transaction};
 
 /// Bump this when adding a migration below. The chain runs from the DB's current
 /// version up to here, one transaction per step.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Managed Tauri state: the single owned connection behind a mutex (rusqlite's
 /// `Connection` is not `Sync`).
@@ -128,6 +128,7 @@ fn apply_migration(tx: &Transaction, version: i64) -> Result<(), String> {
         3 => MIGRATION_V3,
         4 => MIGRATION_V4,
         5 => MIGRATION_V5,
+        6 => MIGRATION_V6,
         other => return Err(format!("no migration defined for schema v{other}")),
     };
     tx.execute_batch(sql)
@@ -254,6 +255,59 @@ const MIGRATION_V5: &str = "
     CREATE INDEX idx_activity_date ON activity_sessions(date);
 ";
 
+/// V6 — product-grade data context. Keep the existing fact/aggregate tables, but
+/// add the metadata future versions need to interpret old data: risk-model
+/// snapshots, local timezone offsets, richer activity explanations, and a stable
+/// reminder lifecycle table linked by `session_uid`.
+const MIGRATION_V6: &str = "
+    ALTER TABLE daily_stats ADD COLUMN metric_version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE daily_stats ADD COLUMN mode TEXT;
+    ALTER TABLE daily_stats ADD COLUMN micro_minutes REAL;
+    ALTER TABLE daily_stats ADD COLUMN deep_minutes REAL;
+    ALTER TABLE daily_stats ADD COLUMN break_seconds REAL;
+    ALTER TABLE daily_stats ADD COLUMN deep_break_minutes REAL;
+    ALTER TABLE daily_stats ADD COLUMN risk_components_json TEXT;
+    ALTER TABLE daily_stats ADD COLUMN timezone_offset_minutes INTEGER;
+
+    ALTER TABLE hourly_stats ADD COLUMN timezone_offset_minutes INTEGER;
+
+    ALTER TABLE reminder_events ADD COLUMN session_uid TEXT;
+    ALTER TABLE reminder_events ADD COLUMN due_ms INTEGER;
+    ALTER TABLE reminder_events ADD COLUMN shown_ms INTEGER;
+    ALTER TABLE reminder_events ADD COLUMN resolved_ms INTEGER;
+    ALTER TABLE reminder_events ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy';
+    ALTER TABLE reminder_events ADD COLUMN focus_minutes INTEGER;
+    ALTER TABLE reminder_events ADD COLUMN target_seconds INTEGER;
+    ALTER TABLE reminder_events ADD COLUMN timezone_offset_minutes INTEGER;
+    CREATE INDEX idx_reminder_session_uid ON reminder_events(session_uid);
+
+    CREATE TABLE reminder_sessions (
+        uid                     TEXT PRIMARY KEY,
+        kind                    TEXT NOT NULL,
+        source                  TEXT NOT NULL,
+        due_ms                  INTEGER,
+        shown_ms                INTEGER NOT NULL,
+        resolved_ms             INTEGER,
+        result                  TEXT,
+        target_seconds          INTEGER NOT NULL,
+        focus_minutes           INTEGER,
+        screen_seconds_at_show  REAL NOT NULL DEFAULT 0,
+        screen_seconds_at_end   REAL,
+        gaze_seconds            REAL NOT NULL DEFAULT 0,
+        timezone_offset_minutes INTEGER,
+        created_at              TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX idx_reminder_sessions_shown ON reminder_sessions(shown_ms);
+
+    ALTER TABLE symptom_records ADD COLUMN timezone_offset_minutes INTEGER;
+
+    ALTER TABLE activity_sessions ADD COLUMN eye_activity_weight REAL NOT NULL DEFAULT 1.0;
+    ALTER TABLE activity_sessions ADD COLUMN should_defer INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE activity_sessions ADD COLUMN is_fullscreen INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE activity_sessions ADD COLUMN reason TEXT;
+    ALTER TABLE activity_sessions ADD COLUMN timezone_offset_minutes INTEGER;
+";
+
 // ---- Settings access -------------------------------------------------------
 
 pub fn get_all_settings(conn: &Connection) -> Result<BTreeMap<String, String>, String> {
@@ -299,6 +353,17 @@ pub fn today_local(conn: &Connection) -> String {
     .unwrap_or_default()
 }
 
+/// Current local timezone offset from UTC, in minutes. Stored with local-day/hour
+/// buckets so history remains interpretable if the user later changes timezone.
+pub fn timezone_offset_minutes(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT CAST(round((julianday('now','localtime') - julianday('now')) * 1440) AS INTEGER)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+}
+
 pub fn schema_version(conn: &Connection) -> i64 {
     current_version(conn)
 }
@@ -317,6 +382,26 @@ pub struct ReminderEventRow {
     pub note: Option<String>,
     /// UTC epoch milliseconds (timezone-safe); `None` only for un-back-fillable rows.
     pub at_ms: Option<i64>,
+    pub session_uid: Option<String>,
+    pub due_ms: Option<i64>,
+    pub shown_ms: Option<i64>,
+    pub resolved_ms: Option<i64>,
+    pub source: Option<String>,
+    pub focus_minutes: Option<i64>,
+    pub target_seconds: Option<i64>,
+    pub timezone_offset_minutes: Option<i64>,
+}
+
+#[derive(Default)]
+pub struct ReminderEventExtra<'a> {
+    pub session_uid: Option<&'a str>,
+    pub due_ms: Option<i64>,
+    pub shown_ms: Option<i64>,
+    pub resolved_ms: Option<i64>,
+    pub source: Option<&'a str>,
+    pub focus_minutes: Option<i64>,
+    pub target_seconds: Option<i64>,
+    pub timezone_offset_minutes: Option<i64>,
 }
 
 /// Record one reminder lifecycle event. `at` defaults to now when `None` (live
@@ -332,14 +417,62 @@ pub fn insert_reminder_event(
     gaze_seconds: f64,
     note: Option<&str>,
 ) -> Result<i64, String> {
+    insert_reminder_event_detailed(
+        conn,
+        at,
+        at_ms,
+        kind,
+        result,
+        active_seconds,
+        gaze_seconds,
+        note,
+        ReminderEventExtra::default(),
+    )
+}
+
+/// Detailed reminder event insert used by the live engine. The extra lifecycle
+/// fields are optional so legacy imports can still use the compact wrapper above.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_reminder_event_detailed(
+    conn: &Connection,
+    at: Option<&str>,
+    at_ms: Option<i64>,
+    kind: &str,
+    result: &str,
+    active_seconds: f64,
+    gaze_seconds: f64,
+    note: Option<&str>,
+    extra: ReminderEventExtra<'_>,
+) -> Result<i64, String> {
     // Live callers pass `at_ms` (a UTC clock); the legacy import passes `None` and the
     // local `at` string is converted to a UTC epoch here (best-effort by machine tz).
+    let tz = extra
+        .timezone_offset_minutes
+        .unwrap_or_else(|| timezone_offset_minutes(conn));
     conn.execute(
-        "INSERT INTO reminder_events(at, at_ms, kind, result, active_seconds, gaze_seconds, note) \
+        "INSERT INTO reminder_events(at, at_ms, kind, result, active_seconds, gaze_seconds, note, \
+            session_uid, due_ms, shown_ms, resolved_ms, source, focus_minutes, target_seconds, \
+            timezone_offset_minutes) \
          VALUES(COALESCE(?1, datetime('now','localtime')), \
                 COALESCE(?2, CAST(strftime('%s', ?1, 'utc') AS INTEGER) * 1000), \
-                ?3, ?4, ?5, ?6, ?7)",
-        params![at, at_ms, kind, result, active_seconds, gaze_seconds, note],
+                ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, 'live'), ?13, ?14, ?15)",
+        params![
+            at,
+            at_ms,
+            kind,
+            result,
+            active_seconds,
+            gaze_seconds,
+            note,
+            extra.session_uid,
+            extra.due_ms,
+            extra.shown_ms,
+            extra.resolved_ms,
+            extra.source,
+            extra.focus_minutes,
+            extra.target_seconds,
+            tz
+        ],
     )
     .map_err(|e| format!("insert reminder_event: {e}"))?;
     Ok(conn.last_insert_rowid())
@@ -351,7 +484,9 @@ pub fn recent_reminder_events(
 ) -> Result<Vec<ReminderEventRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, at, kind, result, active_seconds, gaze_seconds, note, at_ms \
+            "SELECT id, at, kind, result, active_seconds, gaze_seconds, note, at_ms, \
+                    session_uid, due_ms, shown_ms, resolved_ms, source, focus_minutes, \
+                    target_seconds, timezone_offset_minutes \
              FROM reminder_events ORDER BY at_ms DESC, id DESC LIMIT ?1",
         )
         .map_err(|e| format!("prepare recent reminders: {e}"))?;
@@ -366,11 +501,121 @@ pub fn recent_reminder_events(
                 gaze_seconds: row.get(5)?,
                 note: row.get(6)?,
                 at_ms: row.get(7)?,
+                session_uid: row.get(8)?,
+                due_ms: row.get(9)?,
+                shown_ms: row.get(10)?,
+                resolved_ms: row.get(11)?,
+                source: row.get(12)?,
+                focus_minutes: row.get(13)?,
+                target_seconds: row.get(14)?,
+                timezone_offset_minutes: row.get(15)?,
             })
         })
         .map_err(|e| format!("query recent reminders: {e}"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read reminder rows: {e}"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderSessionRow {
+    pub uid: String,
+    pub kind: String,
+    pub source: String,
+    pub due_ms: Option<i64>,
+    pub shown_ms: i64,
+    pub resolved_ms: Option<i64>,
+    pub result: Option<String>,
+    pub target_seconds: i64,
+    pub focus_minutes: Option<i64>,
+    pub screen_seconds_at_show: f64,
+    pub screen_seconds_at_end: Option<f64>,
+    pub gaze_seconds: f64,
+    pub timezone_offset_minutes: Option<i64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn open_reminder_session(
+    conn: &Connection,
+    kind: &str,
+    source: &str,
+    due_ms: Option<i64>,
+    shown_ms: i64,
+    target_seconds: i64,
+    focus_minutes: Option<i64>,
+    screen_seconds_at_show: f64,
+) -> Result<String, String> {
+    let uid = format!("reminder:{shown_ms}:{source}:{kind}");
+    conn.execute(
+        "INSERT OR IGNORE INTO reminder_sessions(uid, kind, source, due_ms, shown_ms, \
+             target_seconds, focus_minutes, screen_seconds_at_show, timezone_offset_minutes) \
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            uid,
+            kind,
+            source,
+            due_ms,
+            shown_ms,
+            target_seconds,
+            focus_minutes,
+            screen_seconds_at_show,
+            timezone_offset_minutes(conn)
+        ],
+    )
+    .map_err(|e| format!("open reminder_session: {e}"))?;
+    Ok(uid)
+}
+
+pub fn resolve_reminder_session(
+    conn: &Connection,
+    uid: &str,
+    result: &str,
+    resolved_ms: i64,
+    screen_seconds_at_end: f64,
+    gaze_seconds: f64,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE reminder_sessions SET result = ?2, resolved_ms = ?3, \
+             screen_seconds_at_end = ?4, gaze_seconds = ?5 WHERE uid = ?1",
+        params![uid, result, resolved_ms, screen_seconds_at_end, gaze_seconds],
+    )
+    .map_err(|e| format!("resolve reminder_session {uid}: {e}"))?;
+    Ok(())
+}
+
+pub fn recent_reminder_sessions(
+    conn: &Connection,
+    limit: i64,
+) -> Result<Vec<ReminderSessionRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT uid, kind, source, due_ms, shown_ms, resolved_ms, result, target_seconds, \
+                    focus_minutes, screen_seconds_at_show, screen_seconds_at_end, gaze_seconds, \
+                    timezone_offset_minutes \
+             FROM reminder_sessions ORDER BY shown_ms DESC LIMIT ?1",
+        )
+        .map_err(|e| format!("prepare reminder_sessions: {e}"))?;
+    let rows = stmt
+        .query_map([limit], |row| {
+            Ok(ReminderSessionRow {
+                uid: row.get(0)?,
+                kind: row.get(1)?,
+                source: row.get(2)?,
+                due_ms: row.get(3)?,
+                shown_ms: row.get(4)?,
+                resolved_ms: row.get(5)?,
+                result: row.get(6)?,
+                target_seconds: row.get(7)?,
+                focus_minutes: row.get(8)?,
+                screen_seconds_at_show: row.get(9)?,
+                screen_seconds_at_end: row.get(10)?,
+                gaze_seconds: row.get(11)?,
+                timezone_offset_minutes: row.get(12)?,
+            })
+        })
+        .map_err(|e| format!("query reminder_sessions: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read reminder_session rows: {e}"))
 }
 
 // ---- Fact tables: symptom records -----------------------------------------
@@ -388,6 +633,7 @@ pub struct SymptomRow {
     pub screen_seconds: f64,
     /// UTC epoch milliseconds (timezone-safe); `None` only for un-back-fillable rows.
     pub at_ms: Option<i64>,
+    pub timezone_offset_minutes: Option<i64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -403,11 +649,22 @@ pub fn insert_symptom(
     screen_seconds: f64,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO symptom_records(at, at_ms, dry, blur, headache, neck, note, screen_seconds) \
+        "INSERT INTO symptom_records(at, at_ms, dry, blur, headache, neck, note, screen_seconds, \
+            timezone_offset_minutes) \
          VALUES(COALESCE(?1, datetime('now','localtime')), \
                 COALESCE(?2, CAST(strftime('%s', ?1, 'utc') AS INTEGER) * 1000), \
-                ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![at, at_ms, dry, blur, headache, neck, note, screen_seconds],
+                ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            at,
+            at_ms,
+            dry,
+            blur,
+            headache,
+            neck,
+            note,
+            screen_seconds,
+            timezone_offset_minutes(conn)
+        ],
     )
     .map_err(|e| format!("insert symptom: {e}"))?;
     Ok(conn.last_insert_rowid())
@@ -416,7 +673,8 @@ pub fn insert_symptom(
 pub fn recent_symptoms(conn: &Connection, limit: i64) -> Result<Vec<SymptomRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, at, dry, blur, headache, neck, note, screen_seconds, at_ms \
+            "SELECT id, at, dry, blur, headache, neck, note, screen_seconds, at_ms, \
+                    timezone_offset_minutes \
              FROM symptom_records ORDER BY at_ms DESC, id DESC LIMIT ?1",
         )
         .map_err(|e| format!("prepare recent symptoms: {e}"))?;
@@ -432,6 +690,7 @@ pub fn recent_symptoms(conn: &Connection, limit: i64) -> Result<Vec<SymptomRow>,
                 note: row.get(6)?,
                 screen_seconds: row.get(7)?,
                 at_ms: row.get(8)?,
+                timezone_offset_minutes: row.get(9)?,
             })
         })
         .map_err(|e| format!("query recent symptoms: {e}"))?;
@@ -443,6 +702,7 @@ pub fn recent_symptoms(conn: &Connection, limit: i64) -> Result<Vec<SymptomRow>,
 
 /// Open an activity session and return its id. `started_ms` is UTC epoch ms; `date`
 /// (local `YYYY-MM-DD`) and `hour` (local 0-23) are stored for cheap day/hour grouping.
+#[allow(clippy::too_many_arguments)]
 pub fn open_activity_session(
     conn: &Connection,
     started_ms: i64,
@@ -450,11 +710,27 @@ pub fn open_activity_session(
     process: Option<&str>,
     date: &str,
     hour: i64,
+    eye_activity_weight: f64,
+    should_defer: bool,
+    is_fullscreen: bool,
+    reason: Option<&str>,
 ) -> Result<i64, String> {
     conn.execute(
-        "INSERT INTO activity_sessions(started_ms, state, process, date, hour, active_seconds) \
-         VALUES(?1, ?2, ?3, ?4, ?5, 0)",
-        params![started_ms, state, process, date, hour],
+        "INSERT INTO activity_sessions(started_ms, state, process, date, hour, active_seconds, \
+             eye_activity_weight, should_defer, is_fullscreen, reason, timezone_offset_minutes) \
+         VALUES(?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            started_ms,
+            state,
+            process,
+            date,
+            hour,
+            eye_activity_weight,
+            if should_defer { 1 } else { 0 },
+            if is_fullscreen { 1 } else { 0 },
+            reason,
+            timezone_offset_minutes(conn)
+        ],
     )
     .map_err(|e| format!("open activity_session: {e}"))?;
     Ok(conn.last_insert_rowid())
@@ -486,6 +762,11 @@ pub struct ActivitySessionRow {
     pub process: Option<String>,
     pub date: String,
     pub hour: i64,
+    pub eye_activity_weight: Option<f64>,
+    pub should_defer: Option<bool>,
+    pub is_fullscreen: Option<bool>,
+    pub reason: Option<String>,
+    pub timezone_offset_minutes: Option<i64>,
 }
 
 /// Most-recent `limit` activity sessions, newest first (used by the data export).
@@ -495,12 +776,15 @@ pub fn recent_activity_sessions(
 ) -> Result<Vec<ActivitySessionRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT started_ms, ended_ms, active_seconds, state, process, date, hour \
+            "SELECT started_ms, ended_ms, active_seconds, state, process, date, hour, \
+                    eye_activity_weight, should_defer, is_fullscreen, reason, timezone_offset_minutes \
              FROM activity_sessions ORDER BY started_ms DESC LIMIT ?1",
         )
         .map_err(|e| format!("prepare activity_sessions: {e}"))?;
     let rows = stmt
         .query_map([limit], |row| {
+            let should_defer: Option<i64> = row.get(8)?;
+            let is_fullscreen: Option<i64> = row.get(9)?;
             Ok(ActivitySessionRow {
                 started_ms: row.get(0)?,
                 ended_ms: row.get(1)?,
@@ -509,6 +793,11 @@ pub fn recent_activity_sessions(
                 process: row.get(4)?,
                 date: row.get(5)?,
                 hour: row.get(6)?,
+                eye_activity_weight: row.get(7)?,
+                should_defer: should_defer.map(|v| v != 0),
+                is_fullscreen: is_fullscreen.map(|v| v != 0),
+                reason: row.get(10)?,
+                timezone_offset_minutes: row.get(11)?,
             })
         })
         .map_err(|e| format!("query activity_sessions: {e}"))?;
@@ -541,6 +830,13 @@ pub struct DailyAgg<'a> {
     pub postponed: i64,
     pub deferred: i64,
     pub risk_score: i64,
+    pub metric_version: i64,
+    pub mode: &'a str,
+    pub micro_minutes: f64,
+    pub deep_minutes: f64,
+    pub break_seconds: f64,
+    pub deep_break_minutes: f64,
+    pub risk_components_json: Option<&'a str>,
 }
 
 /// Upsert a day's row. `risk_peak` is the running max of `risk_score` seen.
@@ -548,8 +844,10 @@ pub fn upsert_daily_stats(conn: &Connection, a: &DailyAgg) -> Result<(), String>
     conn.execute(
         "INSERT INTO daily_stats(date, screen_seconds, distant_gaze_seconds, micro_due, \
              micro_done, deep_due, deep_done, skipped, postponed, deferred, risk_score, \
-             risk_peak, updated_at) \
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, datetime('now','localtime')) \
+             risk_peak, updated_at, metric_version, mode, micro_minutes, deep_minutes, \
+             break_seconds, deep_break_minutes, risk_components_json, timezone_offset_minutes) \
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, datetime('now','localtime'), \
+             ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19) \
          ON CONFLICT(date) DO UPDATE SET \
              screen_seconds = excluded.screen_seconds, \
              distant_gaze_seconds = excluded.distant_gaze_seconds, \
@@ -558,6 +856,11 @@ pub fn upsert_daily_stats(conn: &Connection, a: &DailyAgg) -> Result<(), String>
              skipped = excluded.skipped, postponed = excluded.postponed, \
              deferred = excluded.deferred, risk_score = excluded.risk_score, \
              risk_peak = MAX(daily_stats.risk_peak, excluded.risk_score), \
+             metric_version = excluded.metric_version, mode = excluded.mode, \
+             micro_minutes = excluded.micro_minutes, deep_minutes = excluded.deep_minutes, \
+             break_seconds = excluded.break_seconds, deep_break_minutes = excluded.deep_break_minutes, \
+             risk_components_json = excluded.risk_components_json, \
+             timezone_offset_minutes = excluded.timezone_offset_minutes, \
              updated_at = excluded.updated_at",
         params![
             a.date,
@@ -570,7 +873,15 @@ pub fn upsert_daily_stats(conn: &Connection, a: &DailyAgg) -> Result<(), String>
             a.skipped,
             a.postponed,
             a.deferred,
-            a.risk_score
+            a.risk_score,
+            a.metric_version,
+            a.mode,
+            a.micro_minutes,
+            a.deep_minutes,
+            a.break_seconds,
+            a.deep_break_minutes,
+            a.risk_components_json,
+            timezone_offset_minutes(conn)
         ],
     )
     .map_err(|e| format!("upsert daily_stats: {e}"))?;
@@ -580,9 +891,10 @@ pub fn upsert_daily_stats(conn: &Connection, a: &DailyAgg) -> Result<(), String>
 /// Add eye-use seconds to one (date, hour) heatmap bucket.
 pub fn add_hourly_seconds(conn: &Connection, date: &str, hour: i64, delta: f64) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO hourly_stats(date, hour, screen_seconds) VALUES(?1, ?2, ?3) \
-         ON CONFLICT(date, hour) DO UPDATE SET screen_seconds = screen_seconds + excluded.screen_seconds",
-        params![date, hour, delta],
+        "INSERT INTO hourly_stats(date, hour, screen_seconds, timezone_offset_minutes) VALUES(?1, ?2, ?3, ?4) \
+         ON CONFLICT(date, hour) DO UPDATE SET screen_seconds = screen_seconds + excluded.screen_seconds, \
+             timezone_offset_minutes = excluded.timezone_offset_minutes",
+        params![date, hour, delta, timezone_offset_minutes(conn)],
     )
     .map_err(|e| format!("add hourly_stats: {e}"))?;
     Ok(())
@@ -673,6 +985,14 @@ pub struct DailyStatsRow {
     pub deferred: i64,
     pub risk_score: i64,
     pub risk_peak: i64,
+    pub metric_version: Option<i64>,
+    pub mode: Option<String>,
+    pub micro_minutes: Option<f64>,
+    pub deep_minutes: Option<f64>,
+    pub break_seconds: Option<f64>,
+    pub deep_break_minutes: Option<f64>,
+    pub risk_components_json: Option<String>,
+    pub timezone_offset_minutes: Option<i64>,
 }
 
 /// Most-recent `limit` days, newest first.
@@ -680,7 +1000,9 @@ pub fn query_daily_stats(conn: &Connection, limit: i64) -> Result<Vec<DailyStats
     let mut stmt = conn
         .prepare(
             "SELECT date, screen_seconds, distant_gaze_seconds, micro_due, micro_done, \
-                    deep_due, deep_done, skipped, postponed, deferred, risk_score, risk_peak \
+                    deep_due, deep_done, skipped, postponed, deferred, risk_score, risk_peak, \
+                    metric_version, mode, micro_minutes, deep_minutes, break_seconds, \
+                    deep_break_minutes, risk_components_json, timezone_offset_minutes \
              FROM daily_stats ORDER BY date DESC LIMIT ?1",
         )
         .map_err(|e| format!("prepare daily_stats: {e}"))?;
@@ -699,6 +1021,14 @@ pub fn query_daily_stats(conn: &Connection, limit: i64) -> Result<Vec<DailyStats
                 deferred: row.get(9)?,
                 risk_score: row.get(10)?,
                 risk_peak: row.get(11)?,
+                metric_version: row.get(12)?,
+                mode: row.get(13)?,
+                micro_minutes: row.get(14)?,
+                deep_minutes: row.get(15)?,
+                break_seconds: row.get(16)?,
+                deep_break_minutes: row.get(17)?,
+                risk_components_json: row.get(18)?,
+                timezone_offset_minutes: row.get(19)?,
             })
         })
         .map_err(|e| format!("query daily_stats: {e}"))?;
@@ -712,13 +1042,14 @@ pub struct HourlyStatsRow {
     pub date: String,
     pub hour: i64,
     pub screen_seconds: f64,
+    pub timezone_offset_minutes: Option<i64>,
 }
 
 /// All hourly buckets on or after `since_date` (YYYY-MM-DD), ordered.
 pub fn query_hourly_stats(conn: &Connection, since_date: &str) -> Result<Vec<HourlyStatsRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT date, hour, screen_seconds FROM hourly_stats \
+            "SELECT date, hour, screen_seconds, timezone_offset_minutes FROM hourly_stats \
              WHERE date >= ?1 ORDER BY date, hour",
         )
         .map_err(|e| format!("prepare hourly_stats: {e}"))?;
@@ -728,6 +1059,7 @@ pub fn query_hourly_stats(conn: &Connection, since_date: &str) -> Result<Vec<Hou
                 date: row.get(0)?,
                 hour: row.get(1)?,
                 screen_seconds: row.get(2)?,
+                timezone_offset_minutes: row.get(3)?,
             })
         })
         .map_err(|e| format!("query hourly_stats: {e}"))?;
@@ -735,7 +1067,21 @@ pub fn query_hourly_stats(conn: &Connection, since_date: &str) -> Result<Vec<Hou
         .map_err(|e| format!("read hourly_stats rows: {e}"))
 }
 
-// ---- Reliability (V6): backup, recovery, retention -------------------------
+/// Close sessions that were left open by a crash or forced quit. We use the
+/// accrued active_seconds to avoid turning an overnight app shutdown into a
+/// multi-hour fake eye-use span.
+pub fn close_stale_activity_sessions(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "UPDATE activity_sessions \
+         SET ended_ms = started_ms + CAST(active_seconds * 1000 AS INTEGER) \
+         WHERE ended_ms IS NULL",
+        [],
+    )
+    .map_err(|e| format!("close stale activity_sessions: {e}"))?;
+    Ok(())
+}
+
+// ---- Reliability: backup, recovery, retention ------------------------------
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -801,6 +1147,7 @@ pub fn prune_old(conn: &Connection, days: i64) -> Result<(), String> {
 pub fn export_json(conn: &Connection) -> Result<String, String> {
     let daily = query_daily_stats(conn, 3650)?;
     let hourly = query_hourly_stats(conn, "1970-01-01")?;
+    let reminder_sessions = recent_reminder_sessions(conn, 1_000_000)?;
     let reminders = recent_reminder_events(conn, 1_000_000)?;
     let symptoms = recent_symptoms(conn, 1_000_000)?;
     let activity = recent_activity_sessions(conn, 1_000_000)?;
@@ -810,6 +1157,7 @@ pub fn export_json(conn: &Connection) -> Result<String, String> {
         "exportFormat": 2,
         "dailyStats": daily,
         "hourlyStats": hourly,
+        "reminderSessions": reminder_sessions,
         "reminderEvents": reminders,
         "symptoms": symptoms,
         "activitySessions": activity,
@@ -823,6 +1171,7 @@ pub fn export_json(conn: &Connection) -> Result<String, String> {
 pub struct ImportSummary {
     pub daily: i64,
     pub hourly: i64,
+    pub reminder_sessions: i64,
     pub reminders: i64,
     pub symptoms: i64,
     pub activity: i64,
@@ -846,8 +1195,31 @@ pub fn import_json(conn: &mut Connection, json: &str) -> Result<ImportSummary, S
                 .execute(
                     "INSERT OR IGNORE INTO daily_stats(date, screen_seconds, distant_gaze_seconds, \
                          micro_due, micro_done, deep_due, deep_done, skipped, postponed, deferred, \
-                         risk_score, risk_peak) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                    params![d.date, d.screen_seconds, d.distant_gaze_seconds, d.micro_due, d.micro_done, d.deep_due, d.deep_done, d.skipped, d.postponed, d.deferred, d.risk_score, d.risk_peak],
+                         risk_score, risk_peak, metric_version, mode, micro_minutes, deep_minutes, \
+                         break_seconds, deep_break_minutes, risk_components_json, timezone_offset_minutes) \
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                    params![
+                        d.date,
+                        d.screen_seconds,
+                        d.distant_gaze_seconds,
+                        d.micro_due,
+                        d.micro_done,
+                        d.deep_due,
+                        d.deep_done,
+                        d.skipped,
+                        d.postponed,
+                        d.deferred,
+                        d.risk_score,
+                        d.risk_peak,
+                        d.metric_version,
+                        d.mode,
+                        d.micro_minutes,
+                        d.deep_minutes,
+                        d.break_seconds,
+                        d.deep_break_minutes,
+                        d.risk_components_json,
+                        d.timezone_offset_minutes
+                    ],
                 )
                 .map_err(|e| format!("import daily: {e}"))? as i64;
         }
@@ -858,10 +1230,25 @@ pub fn import_json(conn: &mut Connection, json: &str) -> Result<ImportSummary, S
         for h in hourly {
             s.hourly += tx
                 .execute(
-                    "INSERT OR IGNORE INTO hourly_stats(date, hour, screen_seconds) VALUES(?1,?2,?3)",
-                    params![h.date, h.hour, h.screen_seconds],
+                    "INSERT OR IGNORE INTO hourly_stats(date, hour, screen_seconds, timezone_offset_minutes) VALUES(?1,?2,?3,?4)",
+                    params![h.date, h.hour, h.screen_seconds, h.timezone_offset_minutes],
                 )
                 .map_err(|e| format!("import hourly: {e}"))? as i64;
+        }
+    }
+    if let Some(arr) = v.get("reminderSessions") {
+        let rows: Vec<ReminderSessionRow> =
+            serde_json::from_value(arr.clone()).map_err(|e| format!("parse reminderSessions: {e}"))?;
+        for r in rows {
+            s.reminder_sessions += tx
+                .execute(
+                    "INSERT OR IGNORE INTO reminder_sessions(uid, kind, source, due_ms, shown_ms, resolved_ms, \
+                         result, target_seconds, focus_minutes, screen_seconds_at_show, screen_seconds_at_end, \
+                         gaze_seconds, timezone_offset_minutes) \
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    params![r.uid, r.kind, r.source, r.due_ms, r.shown_ms, r.resolved_ms, r.result, r.target_seconds, r.focus_minutes, r.screen_seconds_at_show, r.screen_seconds_at_end, r.gaze_seconds, r.timezone_offset_minutes],
+                )
+                .map_err(|e| format!("import reminder session: {e}"))? as i64;
         }
     }
     if let Some(arr) = v.get("reminderEvents") {
@@ -870,10 +1257,14 @@ pub fn import_json(conn: &mut Connection, json: &str) -> Result<ImportSummary, S
         for r in rows {
             s.reminders += tx
                 .execute(
-                    "INSERT INTO reminder_events(at, at_ms, kind, result, active_seconds, gaze_seconds, note) \
-                     SELECT ?1,?2,?3,?4,?5,?6,?7 \
-                     WHERE NOT EXISTS(SELECT 1 FROM reminder_events WHERE at_ms IS ?2 AND kind=?3 AND result=?4 AND active_seconds=?5)",
-                    params![r.at, r.at_ms, r.kind, r.result, r.active_seconds, r.gaze_seconds, r.note],
+                    "INSERT INTO reminder_events(at, at_ms, kind, result, active_seconds, gaze_seconds, note, \
+                         session_uid, due_ms, shown_ms, resolved_ms, source, focus_minutes, target_seconds, \
+                         timezone_offset_minutes) \
+                     SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,COALESCE(?12,'import'),?13,?14,?15 \
+                     WHERE NOT EXISTS(SELECT 1 FROM reminder_events WHERE \
+                         ((session_uid IS NOT NULL AND session_uid IS ?8 AND result=?4) OR \
+                          (session_uid IS NULL AND at_ms IS ?2 AND kind=?3 AND result=?4 AND active_seconds=?5)))",
+                    params![r.at, r.at_ms, r.kind, r.result, r.active_seconds, r.gaze_seconds, r.note, r.session_uid, r.due_ms, r.shown_ms, r.resolved_ms, r.source, r.focus_minutes, r.target_seconds, r.timezone_offset_minutes],
                 )
                 .map_err(|e| format!("import reminder: {e}"))? as i64;
         }
@@ -884,10 +1275,10 @@ pub fn import_json(conn: &mut Connection, json: &str) -> Result<ImportSummary, S
         for r in rows {
             s.symptoms += tx
                 .execute(
-                    "INSERT INTO symptom_records(at, at_ms, dry, blur, headache, neck, note, screen_seconds) \
-                     SELECT ?1,?2,?3,?4,?5,?6,?7,?8 \
+                    "INSERT INTO symptom_records(at, at_ms, dry, blur, headache, neck, note, screen_seconds, timezone_offset_minutes) \
+                     SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9 \
                      WHERE NOT EXISTS(SELECT 1 FROM symptom_records WHERE at_ms IS ?2 AND dry=?3 AND blur=?4 AND headache=?5 AND neck=?6)",
-                    params![r.at, r.at_ms, r.dry, r.blur, r.headache, r.neck, r.note, r.screen_seconds],
+                    params![r.at, r.at_ms, r.dry, r.blur, r.headache, r.neck, r.note, r.screen_seconds, r.timezone_offset_minutes],
                 )
                 .map_err(|e| format!("import symptom: {e}"))? as i64;
         }
@@ -898,10 +1289,11 @@ pub fn import_json(conn: &mut Connection, json: &str) -> Result<ImportSummary, S
         for a in rows {
             s.activity += tx
                 .execute(
-                    "INSERT INTO activity_sessions(started_ms, ended_ms, active_seconds, state, process, date, hour) \
-                     SELECT ?1,?2,?3,?4,?5,?6,?7 \
+                    "INSERT INTO activity_sessions(started_ms, ended_ms, active_seconds, state, process, date, hour, \
+                         eye_activity_weight, should_defer, is_fullscreen, reason, timezone_offset_minutes) \
+                     SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12 \
                      WHERE NOT EXISTS(SELECT 1 FROM activity_sessions WHERE started_ms=?1 AND process IS ?5)",
-                    params![a.started_ms, a.ended_ms, a.active_seconds, a.state, a.process, a.date, a.hour],
+                    params![a.started_ms, a.ended_ms, a.active_seconds, a.state, a.process, a.date, a.hour, a.eye_activity_weight.unwrap_or(1.0), a.should_defer.unwrap_or(false) as i64, a.is_fullscreen.unwrap_or(false) as i64, a.reason, a.timezone_offset_minutes],
                 )
                 .map_err(|e| format!("import activity: {e}"))? as i64;
         }
@@ -943,6 +1335,13 @@ mod tests {
             postponed: 0,
             deferred: 0,
             risk_score: risk,
+            metric_version: 1,
+            mode: "balanced",
+            micro_minutes: 20.0,
+            deep_minutes: 60.0,
+            break_seconds: 20.0,
+            deep_break_minutes: 3.0,
+            risk_components_json: Some(r#"{"modelVersion":1,"score":40}"#),
         }
     }
 
@@ -959,6 +1358,7 @@ mod tests {
             "symptom_records",
             "daily_stats",
             "hourly_stats",
+            "reminder_sessions",
         ] {
             let n: i64 = conn
                 .query_row(
@@ -1070,20 +1470,42 @@ mod tests {
     fn activity_session_open_accrue_close() {
         let path = temp_path();
         let conn = open(&path).unwrap();
-        let id = open_activity_session(&conn, 1_700_000_000_000, "active", Some("chrome.exe"), "2026-06-19", 14).unwrap();
+        let id = open_activity_session(
+            &conn,
+            1_700_000_000_000,
+            "active",
+            Some("chrome.exe"),
+            "2026-06-19",
+            14,
+            0.8,
+            false,
+            false,
+            Some("keyboard/mouse active"),
+        )
+        .unwrap();
         update_activity_session(&conn, id, 30.0, None).unwrap(); // accrue, still open
         update_activity_session(&conn, id, 45.0, Some(1_700_000_045_000)).unwrap(); // close
-        let (secs, ended, state, process): (f64, Option<i64>, String, Option<String>) = conn
+        let (secs, ended, state, process, weight, reason): (
+            f64,
+            Option<i64>,
+            String,
+            Option<String>,
+            f64,
+            Option<String>,
+        ) = conn
             .query_row(
-                "SELECT active_seconds, ended_ms, state, process FROM activity_sessions WHERE id = ?1",
+                "SELECT active_seconds, ended_ms, state, process, eye_activity_weight, reason \
+                 FROM activity_sessions WHERE id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .unwrap();
         assert!((secs - 45.0).abs() < 1e-9);
         assert_eq!(ended, Some(1_700_000_045_000));
         assert_eq!(state, "active");
         assert_eq!(process.as_deref(), Some("chrome.exe"));
+        assert!((weight - 0.8).abs() < 1e-9);
+        assert_eq!(reason.as_deref(), Some("keyboard/mouse active"));
         drop(conn);
         cleanup(&path);
     }
@@ -1092,11 +1514,11 @@ mod tests {
     fn app_and_state_aggregation() {
         let path = temp_path();
         let conn = open(&path).unwrap();
-        let id1 = open_activity_session(&conn, 1, "active", Some("chrome.exe"), "2026-06-19", 9).unwrap();
+        let id1 = open_activity_session(&conn, 1, "active", Some("chrome.exe"), "2026-06-19", 9, 1.0, false, false, None).unwrap();
         update_activity_session(&conn, id1, 100.0, Some(2)).unwrap();
-        let id2 = open_activity_session(&conn, 3, "reading", Some("chrome.exe"), "2026-06-19", 10).unwrap();
+        let id2 = open_activity_session(&conn, 3, "reading", Some("chrome.exe"), "2026-06-19", 10, 0.7, false, false, Some("reading")).unwrap();
         update_activity_session(&conn, id2, 50.0, Some(4)).unwrap();
-        let id3 = open_activity_session(&conn, 5, "active", Some("code.exe"), "2026-06-19", 11).unwrap();
+        let id3 = open_activity_session(&conn, 5, "active", Some("code.exe"), "2026-06-19", 11, 1.0, false, false, None).unwrap();
         update_activity_session(&conn, id3, 200.0, Some(6)).unwrap();
 
         let apps = query_app_usage(&conn, "2026-06-19", 10).unwrap();
@@ -1126,7 +1548,9 @@ mod tests {
         insert_symptom(&conn, None, Some(2000), 3, 2, 1, 0, None, 1200.0).unwrap();
         upsert_daily_stats(&conn, &agg("2026-06-19", 40)).unwrap();
         add_hourly_seconds(&conn, "2026-06-19", 14, 100.0).unwrap();
-        let aid = open_activity_session(&conn, 5000, "active", Some("chrome.exe"), "2026-06-19", 14).unwrap();
+        let uid = open_reminder_session(&conn, "micro", "auto", Some(900), 1000, 20, Some(24), 100.0).unwrap();
+        resolve_reminder_session(&conn, &uid, "completed", 1200, 120.0, 20.0).unwrap();
+        let aid = open_activity_session(&conn, 5000, "active", Some("chrome.exe"), "2026-06-19", 14, 1.0, false, false, None).unwrap();
         update_activity_session(&conn, aid, 60.0, Some(6000)).unwrap();
         let json = export_json(&conn).unwrap();
         drop(conn);
@@ -1134,9 +1558,9 @@ mod tests {
         let dst = temp_path();
         let mut conn2 = open(&dst).unwrap();
         let s1 = import_json(&mut conn2, &json).unwrap();
-        assert_eq!((s1.daily, s1.hourly, s1.reminders, s1.symptoms, s1.activity), (1, 1, 1, 1, 1), "fresh import inserts all");
+        assert_eq!((s1.daily, s1.hourly, s1.reminder_sessions, s1.reminders, s1.symptoms, s1.activity), (1, 1, 1, 1, 1, 1), "fresh import inserts all");
         let s2 = import_json(&mut conn2, &json).unwrap();
-        assert_eq!((s2.daily, s2.hourly, s2.reminders, s2.symptoms, s2.activity), (0, 0, 0, 0, 0), "re-import is fully deduped");
+        assert_eq!((s2.daily, s2.hourly, s2.reminder_sessions, s2.reminders, s2.symptoms, s2.activity), (0, 0, 0, 0, 0, 0), "re-import is fully deduped");
         assert_eq!(recent_reminder_events(&conn2, 10).unwrap().len(), 1);
         assert_eq!(query_daily_stats(&conn2, 10).unwrap().len(), 1);
         assert_eq!(recent_symptoms(&conn2, 10).unwrap()[0].dry, 3);

@@ -410,6 +410,17 @@ async fn check_for_update<R: Runtime>(app: AppHandle<R>) -> Result<Option<String
 struct EngineHandle {
     engine: std::sync::Mutex<engine::Engine>,
     snapshot: std::sync::Mutex<ActivitySnapshot>,
+    active_reminder: std::sync::Mutex<Option<ReminderMeta>>,
+}
+
+#[derive(Clone)]
+struct ReminderMeta {
+    session_uid: String,
+    due_ms: Option<i64>,
+    shown_ms: i64,
+    source: String,
+    target_seconds: i64,
+    focus_minutes: Option<i64>,
 }
 
 fn fallback_snapshot() -> ActivitySnapshot {
@@ -521,6 +532,7 @@ fn current_live(eh: &EngineHandle) -> LiveState {
     build_live_state(&e, &s, now_ms())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_reminder_event<R: Runtime>(
     app: &AppHandle<R>,
     kind: &str,
@@ -528,12 +540,78 @@ fn record_reminder_event<R: Runtime>(
     active: f64,
     gaze: f64,
     note: Option<&str>,
+    meta: Option<&ReminderMeta>,
+    source: &str,
 ) {
     if let Some(db) = app.try_state::<db::Database>() {
         if let Ok(conn) = db.conn.lock() {
-            let _ = db::insert_reminder_event(&conn, None, Some(now_ms() as i64), kind, result, active, gaze, note);
+            let resolved_ms = now_ms() as i64;
+            let extra = db::ReminderEventExtra {
+                session_uid: meta.map(|m| m.session_uid.as_str()),
+                due_ms: meta.and_then(|m| m.due_ms),
+                shown_ms: meta.map(|m| m.shown_ms),
+                resolved_ms: Some(resolved_ms),
+                source: Some(meta.map(|m| m.source.as_str()).unwrap_or(source)),
+                focus_minutes: meta.and_then(|m| m.focus_minutes),
+                target_seconds: meta.map(|m| m.target_seconds),
+                timezone_offset_minutes: Some(db::timezone_offset_minutes(&conn)),
+            };
+            let _ = db::insert_reminder_event_detailed(
+                &conn,
+                None,
+                Some(resolved_ms),
+                kind,
+                result,
+                active,
+                gaze,
+                note,
+                extra,
+            );
+            if let Some(meta) = meta {
+                let _ = db::resolve_reminder_session(
+                    &conn,
+                    &meta.session_uid,
+                    result,
+                    resolved_ms,
+                    active,
+                    gaze,
+                );
+            }
         }
     }
+}
+
+fn open_reminder_session<R: Runtime>(
+    app: &AppHandle<R>,
+    kind: &str,
+    source: &str,
+    due_ms: Option<i64>,
+    target_seconds: i64,
+    focus_minutes: Option<i64>,
+    screen_seconds_at_show: f64,
+) -> Option<ReminderMeta> {
+    let shown_ms = now_ms() as i64;
+    let db = app.try_state::<db::Database>()?;
+    let conn = db.conn.lock().ok()?;
+    let session_uid = db::open_reminder_session(
+        &conn,
+        kind,
+        source,
+        due_ms,
+        shown_ms,
+        target_seconds,
+        focus_minutes,
+        screen_seconds_at_show,
+    )
+    .ok()?;
+    Some(ReminderMeta {
+        session_uid,
+        due_ms,
+        shown_ms,
+        source: source.to_string(),
+        target_seconds,
+        focus_minutes,
+    })
 }
 
 fn persist_engine<R: Runtime>(app: &AppHandle<R>) {
@@ -563,6 +641,9 @@ fn upsert_daily<R: Runtime>(app: &AppHandle<R>, e: &engine::Engine) {
     }
     if let Some(db) = app.try_state::<db::Database>() {
         if let Ok(conn) = db.conn.lock() {
+            let preset = e.mode.preset();
+            let risk_components = e.compute_risk_components(e.continuous, e.micro_active);
+            let risk_components_json = serde_json::to_string(&risk_components).ok();
             let _ = db::upsert_daily_stats(
                 &conn,
                 &db::DailyAgg {
@@ -577,6 +658,13 @@ fn upsert_daily<R: Runtime>(app: &AppHandle<R>, e: &engine::Engine) {
                     postponed: e.postponed,
                     deferred: e.deferred,
                     risk_score: e.risk,
+                    metric_version: risk_components.model_version,
+                    mode: e.mode.as_str(),
+                    micro_minutes: preset.micro_minutes,
+                    deep_minutes: preset.deep_minutes,
+                    break_seconds: preset.break_seconds,
+                    deep_break_minutes: preset.deep_break_minutes,
+                    risk_components_json: risk_components_json.as_deref(),
                 },
             );
         }
@@ -650,11 +738,17 @@ fn handle_overlay_action<R: Runtime>(app: &AppHandle<R>, payload: &str) {
         _ => return,
     };
     let now = now_ms();
-    let (outcome, active) = match app.try_state::<EngineHandle>() {
+    let (outcome, active, meta) = match app.try_state::<EngineHandle>() {
         Some(eh) => {
             let mut e = eh.engine.lock().unwrap_or_else(|p| p.into_inner());
             let active = e.screen_seconds;
-            (e.resolve(result, now), active)
+            let outcome = e.resolve(result, now);
+            let meta = eh
+                .active_reminder
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            (outcome, active, meta)
         }
         None => return,
     };
@@ -664,7 +758,16 @@ fn handle_overlay_action<R: Runtime>(app: &AppHandle<R>, payload: &str) {
             engine::Reminder::Postponed => "postponed",
             engine::Reminder::Skipped => "skipped",
         };
-        record_reminder_event(app, kind.as_str(), result_str, active, gaze, None);
+        record_reminder_event(
+            app,
+            kind.as_str(),
+            result_str,
+            active,
+            gaze,
+            None,
+            meta.as_ref(),
+            "overlay",
+        );
         persist_engine(app);
     }
 }
@@ -836,7 +939,18 @@ fn spawn_engine_loop<R: Runtime + 'static>(app: AppHandle<R>) {
                                 }
                                 let hour = db::local_hour(&conn);
                                 let proc_opt = (!process.is_empty()).then_some(process.as_str());
-                                if let Ok(id) = db::open_activity_session(&conn, now_ms_val as i64, state, proc_opt, &today, hour) {
+                                if let Ok(id) = db::open_activity_session(
+                                    &conn,
+                                    now_ms_val as i64,
+                                    state,
+                                    proc_opt,
+                                    &today,
+                                    hour,
+                                    snap.eye_activity_weight,
+                                    snap.should_defer,
+                                    snap.is_fullscreen,
+                                    Some(&snap.reason),
+                                ) {
                                     session.id = Some(id);
                                     session.state = state;
                                     session.process = process.clone();
@@ -860,10 +974,49 @@ fn spawn_engine_loop<R: Runtime + 'static>(app: AppHandle<R>) {
             match decision {
                 engine::Decision::Fire { deep, seconds } => {
                     let focus_minutes = (live.continuous / 60.0).round() as i64;
+                    let kind = if deep { "deep" } else { "micro" };
+                    let meta = open_reminder_session(
+                        &app,
+                        kind,
+                        "auto",
+                        Some(now_ms_val as i64),
+                        seconds as i64,
+                        Some(focus_minutes),
+                        live.screen_seconds,
+                    );
+                    if let (Some(eh), Some(meta)) = (app.try_state::<EngineHandle>(), meta) {
+                        *eh.active_reminder.lock().unwrap_or_else(|p| p.into_inner()) = Some(meta);
+                    }
                     fire_reminder(&app, deep, seconds, live.image_index, live.eye_score, focus_minutes);
                 }
                 engine::Decision::Deferred => {
-                    record_reminder_event(&app, "micro", "deferred", live.screen_seconds, 0.0, Some(&snap.reason));
+                    let preset = app
+                        .try_state::<EngineHandle>()
+                        .map(|eh| eh.engine.lock().unwrap_or_else(|p| p.into_inner()).mode.preset());
+                    let target_seconds = preset.map(|p| p.break_seconds as i64);
+                    if let (Some(db), Some(target_seconds)) = (app.try_state::<db::Database>(), target_seconds) {
+                        if let Ok(conn) = db.conn.lock() {
+                            let _ = db::insert_reminder_event_detailed(
+                                &conn,
+                                None,
+                                Some(now_ms_val as i64),
+                                "micro",
+                                "deferred",
+                                live.screen_seconds,
+                                0.0,
+                                Some(&snap.reason),
+                                db::ReminderEventExtra {
+                                    due_ms: Some(now_ms_val as i64),
+                                    resolved_ms: Some(now_ms_val as i64),
+                                    source: Some("auto-deferred"),
+                                    focus_minutes: Some((live.continuous / 60.0).round() as i64),
+                                    target_seconds: Some(target_seconds),
+                                    timezone_offset_minutes: Some(db::timezone_offset_minutes(&conn)),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    }
                     persist_engine(&app);
                 }
                 engine::Decision::None => {}
@@ -991,10 +1144,22 @@ fn engine_rest_now<R: Runtime + 'static>(app: AppHandle<R>, eh: State<EngineHand
                 score_from_risk(e.risk),
                 eye_image_index(e.risk),
                 (e.continuous / 60.0).round() as i64,
+                e.screen_seconds,
             ))
         }
     };
-    if let Some((seconds, score, image, focus_minutes)) = fire {
+    if let Some((seconds, score, image, focus_minutes, screen_seconds)) = fire {
+        if let Some(meta) = open_reminder_session(
+            &app,
+            "micro",
+            "manual",
+            None,
+            seconds as i64,
+            Some(focus_minutes),
+            screen_seconds,
+        ) {
+            *eh.active_reminder.lock().unwrap_or_else(|p| p.into_inner()) = Some(meta);
+        }
         schedule_fire_reminder(app.clone(), false, seconds, image, score, focus_minutes);
     }
     current_live(&eh)
@@ -1142,6 +1307,8 @@ fn import_legacy_json<R: Runtime>(app: &AppHandle<R>) {
         );
     }
     if !legacy.today.date.is_empty() && legacy.today.screen_seconds > 0.0 {
+        let legacy_mode = engine::Mode::from_str(&legacy.settings.mode);
+        let preset = legacy_mode.preset();
         let _ = db::upsert_daily_stats(
             &conn,
             &db::DailyAgg {
@@ -1156,6 +1323,13 @@ fn import_legacy_json<R: Runtime>(app: &AppHandle<R>) {
                 postponed: legacy.today.postponed,
                 deferred: legacy.today.deferred,
                 risk_score: legacy.today.risk_score,
+                metric_version: engine::RISK_MODEL_VERSION,
+                mode: legacy_mode.as_str(),
+                micro_minutes: preset.micro_minutes,
+                deep_minutes: preset.deep_minutes,
+                break_seconds: preset.break_seconds,
+                deep_break_minutes: preset.deep_break_minutes,
+                risk_components_json: None,
             },
         );
     }
@@ -1258,6 +1432,7 @@ pub fn run() {
                             .and_then(|s| s.parse::<i64>().ok())
                             .unwrap_or(90)
                             .clamp(30, 3650);
+                        let _ = db::close_stale_activity_sessions(&conn);
                         let _ = db::prune_old(&conn, retention);
                         app.manage(db::Database {
                             conn: std::sync::Mutex::new(conn),
@@ -1278,6 +1453,7 @@ pub fn run() {
             app.manage(EngineHandle {
                 engine: std::sync::Mutex::new(engine_state),
                 snapshot: std::sync::Mutex::new(fallback_snapshot()),
+                active_reminder: std::sync::Mutex::new(None),
             });
             spawn_engine_loop(app.handle().clone());
             {

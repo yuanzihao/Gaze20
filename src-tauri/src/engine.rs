@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 const SECS_PER_MIN: f64 = 60.0;
+pub const RISK_MODEL_VERSION: i64 = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -54,6 +55,18 @@ pub struct Preset {
     pub deep_minutes: f64,
     pub break_seconds: f64,
     pub deep_break_minutes: f64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RiskComponents {
+    pub model_version: i64,
+    pub continuous: f64,
+    pub total: f64,
+    pub completion: f64,
+    pub gaze: f64,
+    pub pressure: f64,
+    pub score: i64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -185,9 +198,10 @@ impl Engine {
         }
     }
 
-    /// Risk score 0-100. Mirrors the frontend `computeRisk` exactly, including that
-    /// it always uses the configured minutes (not the debug-fast thresholds).
-    pub fn compute_risk(&self, continuous: f64, micro_active: f64) -> i64 {
+    /// Risk components 0-100. Mirrors the frontend `computeRisk` exactly,
+    /// including that it always uses the configured minutes (not the debug-fast
+    /// thresholds). Persisted daily so future algorithm changes remain explainable.
+    pub fn compute_risk_components(&self, continuous: f64, micro_active: f64) -> RiskComponents {
         let preset = self.mode.preset();
         let continuous_risk = clamp(continuous / (90.0 * 60.0), 0.0, 1.0) * 30.0;
         let total_risk = clamp(self.screen_seconds / (8.0 * 3600.0), 0.0, 1.0) * 20.0;
@@ -199,12 +213,26 @@ impl Engine {
         let gaze_target = (self.micro_done as f64 * preset.break_seconds).max(1.0);
         let gaze_risk = (1.0 - clamp(self.distant_gaze / gaze_target, 0.0, 1.0)) * 10.0;
         let pressure_risk = clamp(micro_active / (preset.micro_minutes * SECS_PER_MIN), 0.0, 1.0) * 20.0;
-        clamp(
+        let score = clamp(
             continuous_risk + total_risk + completion_risk + gaze_risk + pressure_risk,
             0.0,
             100.0,
         )
-        .round() as i64
+        .round() as i64;
+        RiskComponents {
+            model_version: RISK_MODEL_VERSION,
+            continuous: continuous_risk,
+            total: total_risk,
+            completion: completion_risk,
+            gaze: gaze_risk,
+            pressure: pressure_risk,
+            score,
+        }
+    }
+
+    /// Risk score 0-100.
+    pub fn compute_risk(&self, continuous: f64, micro_active: f64) -> i64 {
+        self.compute_risk_components(continuous, micro_active).score
     }
 
     /// Advance one tick. `dt` is elapsed seconds (the host clamps it), `eye_weight`
