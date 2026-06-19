@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Gaze20",
+  "productName": "远眺 Gaze20",
   "version": "0.2.0",
   "identifier": "com.gaze20.desktop",
   "build": {
@@ -33,8 +33,17 @@
     "targets": "all",
     "category": "Productivity",
     "icon": ["icons/icon.ico"],
-    "shortDescription": "Low-interruption 20-20-20 eye-care reminder",
-    "longDescription": "Gaze20 is a local-first Windows desktop eye-care reminder with activity-aware 20-20-20 breaks, deep breaks, local trends, and do-not-disturb handling."
+    "shortDescription": "远眺 Gaze20 护眼提醒软件",
+    "longDescription": "远眺 Gaze20 is a local-first Windows desktop eye-care reminder with activity-aware 20-20-20 breaks, deep breaks, local trends, and do-not-disturb handling.",
+    "windows": {
+      "wix": {
+        "upgradeCode": "99b431b9-8535-5d42-ba29-077039d0cf35",
+        "language": "zh-CN"
+      },
+      "nsis": {
+        "languages": ["SimpChinese"]
+      }
+    }
   },
   "plugins": {
     "updater": {

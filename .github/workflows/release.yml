@@ -1,4 +1,4 @@
-name: Release Gaze20
+name: Release 远眺 Gaze20
 
 on:
   push:
@@ -81,7 +81,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $portableName = "Gaze20_${version}_portable_x64"
+          $portableName = "远眺_Gaze20_${version}_portable_x64"
           $portableDir = Join-Path "artifacts" $portableName
           New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 
@@ -95,11 +95,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          name: Gaze20 ${{ steps.version.outputs.tag }}
+          name: 远眺 Gaze20 ${{ steps.version.outputs.tag }}
           generate_release_notes: true
           make_latest: true
           fail_on_unmatched_files: true
           files: |
             src-tauri/target/release/bundle/nsis/*setup.exe
             src-tauri/target/release/bundle/msi/*.msi
-            artifacts/Gaze20_${{ steps.version.outputs.version }}_portable_x64.zip
+            artifacts/远眺_Gaze20_${{ steps.version.outputs.version }}_portable_x64.zip

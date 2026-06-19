@@ -1,4 +1,4 @@
-name: Build Gaze20
+name: Build 远眺 Gaze20
 
 on:
   push:
@@ -77,14 +77,14 @@ jobs:
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
-          name: gaze20-windows-exe
+          name: 远眺-Gaze20-windows-exe
           path: src-tauri/target/release/gaze20.exe
           if-no-files-found: error
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
-          name: gaze20-windows-installers
+          name: 远眺-Gaze20-windows-installers
           path: |
             src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/nsis/*setup.exe

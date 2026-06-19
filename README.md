@@ -132,7 +132,7 @@
 
 ### 方式一：直接安装（推荐普通用户）
 
-1. 到 [Releases](#) 下载最新的 `Gaze20_x.y.z_x64-setup.exe`（NSIS 安装包）或 `Gaze20_x.y.z_x64_en-US.msi`。
+1. 到 [Releases](#) 下载最新的 `远眺 Gaze20_x.y.z_x64-setup.exe`（NSIS 安装包）、`远眺 Gaze20_x.y.z_x64_zh-CN.msi`，或免安装版 `远眺_Gaze20_x.y.z_portable_x64.zip`。
 2. 双击安装。首次运行后程序常驻系统托盘，最小化时仍在后台计时。
 3. 右键托盘图标可：打开主界面 / 立即远眺 / 暂停记录 / 退出。
 

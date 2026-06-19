@@ -1,8 +1,8 @@
 [package]
 name = "gaze20"
 version = "0.2.0"
-description = "Gaze20 desktop eye-care reminder"
-authors = ["Gaze20"]
+description = "远眺 Gaze20 desktop eye-care reminder"
+authors = ["远眺 Gaze20"]
 edition = "2021"
 
 [lib]
