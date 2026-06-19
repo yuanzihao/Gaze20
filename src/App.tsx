@@ -379,6 +379,8 @@ type DbDailyRow = {
 };
 
 type DbHourlyRow = { date: string; hour: number; screenSeconds: number };
+type DbAppUsageRow = { process: string | null; activeSeconds: number; sessions: number };
+type DbStateRow = { state: string; activeSeconds: number };
 
 function localIsoDate(d: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
@@ -1347,11 +1349,15 @@ function TrendStatsPage(props: { data: PersistedData; onExport: () => void }) {
   const count = range === "30天" ? 30 : range === "自定义" ? 14 : 7;
   const [daily, setDaily] = useState<DbDailyRow[]>([]);
   const [hourly, setHourly] = useState<DbHourlyRow[]>([]);
+  const [appUsage, setAppUsage] = useState<DbAppUsageRow[]>([]);
+  const [stateBreak, setStateBreak] = useState<DbStateRow[]>([]);
   const symptoms = props.data.symptoms ?? [];
 
   useEffect(() => {
     safeInvoke<DbDailyRow[]>("db_daily_stats", { limit: count }).then((rows) => setDaily(rows ?? []));
     safeInvoke<DbHourlyRow[]>("db_hourly_stats", { days: 7 }).then((rows) => setHourly(rows ?? []));
+    safeInvoke<DbAppUsageRow[]>("db_app_usage", { days: count, limit: 8 }).then((rows) => setAppUsage(rows ?? []));
+    safeInvoke<DbStateRow[]>("db_state_breakdown", { days: count }).then((rows) => setStateBreak(rows ?? []));
   }, [count]);
 
   // Continuous day axis (oldest -> newest), zero-filling days without data.
@@ -1535,6 +1541,68 @@ function TrendStatsPage(props: { data: PersistedData; onExport: () => void }) {
             <div style={deltaUp}>{card.delta}</div>
           </div>
         ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 20 }}>
+        <div style={dzCard}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+            <div style={dzH}>按 App 用眼 Top</div>
+            <div style={{ fontSize: 11.5, color: "#9aada5", fontWeight: 600 }}>近 {count} 天 · 有效用眼时长</div>
+          </div>
+          {appUsage.length === 0 ? (
+            <div style={{ fontSize: 12.5, color: "#9aada5", padding: "18px 2px" }}>暂无活动记录（开始用眼后会自动累计）。</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 14 }}>
+              {appUsage.map((a, i) => {
+                const max = appUsage[0].activeSeconds || 1;
+                const name = (a.process ?? "未知窗口").replace(/\.exe$/i, "");
+                return (
+                  <div key={a.process ?? `?${i}`} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ width: 104, flex: "none", fontSize: 12.5, color: "#41584f", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={a.process ?? "未知窗口"}>{name}</span>
+                    <div style={{ flex: 1, minWidth: 0, height: 16, background: "#eef5f1", borderRadius: 5, overflow: "hidden" }}>
+                      <div style={{ width: `${Math.max(3, (a.activeSeconds / max) * 100)}%`, height: "100%", background: "linear-gradient(90deg,#5fcaa6,#2c8e76)", borderRadius: 5 }} />
+                    </div>
+                    <span style={{ width: 62, flex: "none", textAlign: "right", fontFamily: "'Manrope'", fontSize: 12.5, fontWeight: 700, color: "#2c8e76" }}>{formatDuration(a.activeSeconds, true)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        <div style={dzCard}>
+          <div style={dzH}>用眼构成</div>
+          {(() => {
+            const labelMap: Record<string, { label: string; color: string }> = {
+              active: { label: "主动操作", color: "#2caa7e" },
+              reading: { label: "阅读浏览", color: "#5b8def" },
+              meeting: { label: "会议/演示", color: "#eaa13a" }
+            };
+            const total = stateBreak.reduce((a, s) => a + s.activeSeconds, 0);
+            if (total <= 0) return <div style={{ fontSize: 12.5, color: "#9aada5", padding: "18px 2px" }}>暂无活动记录。</div>;
+            return (
+              <div style={{ marginTop: 14 }}>
+                <div style={{ display: "flex", height: 16, borderRadius: 6, overflow: "hidden", marginBottom: 14 }}>
+                  {stateBreak.map((s) => (
+                    <div key={s.state} title={`${labelMap[s.state]?.label ?? s.state} ${Math.round((s.activeSeconds / total) * 100)}%`} style={{ width: `${(s.activeSeconds / total) * 100}%`, background: labelMap[s.state]?.color ?? "#9aada5" }} />
+                  ))}
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+                  {stateBreak.map((s) => {
+                    const m = labelMap[s.state] ?? { label: s.state, color: "#9aada5" };
+                    return (
+                      <div key={s.state} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#41584f", fontWeight: 600 }}>
+                        <span style={{ width: 10, height: 10, borderRadius: 3, background: m.color, flex: "none" }} />
+                        <span style={{ flex: 1 }}>{m.label}</span>
+                        <span style={{ fontFamily: "'Manrope'", fontWeight: 700 }}>{Math.round((s.activeSeconds / total) * 100)}%</span>
+                        <span style={{ width: 56, textAlign: "right", color: "#6f857c" }}>{formatDuration(s.activeSeconds, true)}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
+        </div>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 360px", gap: 20 }}>

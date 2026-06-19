@@ -348,6 +348,38 @@ fn db_hourly_stats(
     db::query_hourly_stats(&conn, &since)
 }
 
+/// `date('now','localtime', -N days)` — the local start date of the last `n` days.
+fn since_date(conn: &rusqlite::Connection, days: Option<i64>) -> String {
+    let n = days.unwrap_or(7).clamp(1, 365);
+    conn.query_row(
+        "SELECT date('now','localtime', ?1)",
+        [format!("-{} days", n - 1)],
+        |row| row.get(0),
+    )
+    .unwrap_or_default()
+}
+
+#[tauri::command]
+fn db_app_usage(
+    db: State<db::Database>,
+    days: Option<i64>,
+    limit: Option<i64>,
+) -> Result<Vec<db::AppUsageRow>, String> {
+    let conn = db.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
+    let since = since_date(&conn, days);
+    db::query_app_usage(&conn, &since, limit.unwrap_or(8).clamp(1, 50))
+}
+
+#[tauri::command]
+fn db_state_breakdown(
+    db: State<db::Database>,
+    days: Option<i64>,
+) -> Result<Vec<db::StateUsageRow>, String> {
+    let conn = db.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
+    let since = since_date(&conn, days);
+    db::query_state_breakdown(&conn, &since)
+}
+
 #[tauri::command]
 fn db_export(db: State<db::Database>) -> Result<String, String> {
     let conn = db.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
@@ -1347,6 +1379,8 @@ pub fn run() {
             db_recent_reminders,
             db_daily_stats,
             db_hourly_stats,
+            db_app_usage,
+            db_state_breakdown,
             db_export,
             check_for_update,
             engine_get_state,

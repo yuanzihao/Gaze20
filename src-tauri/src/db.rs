@@ -548,6 +548,76 @@ pub fn add_hourly_seconds(conn: &Connection, date: &str, hour: i64, delta: f64) 
     Ok(())
 }
 
+// ---- Derived analytics from the activity_sessions fact layer (V5) ----------
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUsageRow {
+    /// Foreground process name (e.g. `chrome.exe`); `None` for unknown windows.
+    pub process: Option<String>,
+    pub active_seconds: f64,
+    pub sessions: i64,
+}
+
+/// Eye-use time grouped by foreground process since `since_date` (local `YYYY-MM-DD`),
+/// busiest first. Powers the "which apps strain your eyes most" view.
+pub fn query_app_usage(
+    conn: &Connection,
+    since_date: &str,
+    limit: i64,
+) -> Result<Vec<AppUsageRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT process, SUM(active_seconds) AS secs, COUNT(*) AS sessions \
+             FROM activity_sessions WHERE date >= ?1 \
+             GROUP BY process ORDER BY secs DESC LIMIT ?2",
+        )
+        .map_err(|e| format!("prepare app_usage: {e}"))?;
+    let rows = stmt
+        .query_map(params![since_date, limit], |row| {
+            Ok(AppUsageRow {
+                process: row.get(0)?,
+                active_seconds: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                sessions: row.get(2)?,
+            })
+        })
+        .map_err(|e| format!("query app_usage: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read app_usage rows: {e}"))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateUsageRow {
+    /// `active` (typing) / `reading` (no input but on-screen) / `meeting` (fullscreen/call).
+    pub state: String,
+    pub active_seconds: f64,
+}
+
+/// Eye-use time grouped by activity state since `since_date` — the "use construction"
+/// breakdown (active vs passive reading vs meeting).
+pub fn query_state_breakdown(
+    conn: &Connection,
+    since_date: &str,
+) -> Result<Vec<StateUsageRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT state, SUM(active_seconds) AS secs FROM activity_sessions \
+             WHERE date >= ?1 GROUP BY state ORDER BY secs DESC",
+        )
+        .map_err(|e| format!("prepare state_breakdown: {e}"))?;
+    let rows = stmt
+        .query_map(params![since_date], |row| {
+            Ok(StateUsageRow {
+                state: row.get(0)?,
+                active_seconds: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+            })
+        })
+        .map_err(|e| format!("query state_breakdown: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read state_breakdown rows: {e}"))
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyStatsRow {
@@ -875,6 +945,36 @@ mod tests {
         assert_eq!(ended, Some(1_700_000_045_000));
         assert_eq!(state, "active");
         assert_eq!(process.as_deref(), Some("chrome.exe"));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn app_and_state_aggregation() {
+        let path = temp_path();
+        let conn = open(&path).unwrap();
+        let id1 = open_activity_session(&conn, 1, "active", Some("chrome.exe"), "2026-06-19", 9).unwrap();
+        update_activity_session(&conn, id1, 100.0, Some(2)).unwrap();
+        let id2 = open_activity_session(&conn, 3, "reading", Some("chrome.exe"), "2026-06-19", 10).unwrap();
+        update_activity_session(&conn, id2, 50.0, Some(4)).unwrap();
+        let id3 = open_activity_session(&conn, 5, "active", Some("code.exe"), "2026-06-19", 11).unwrap();
+        update_activity_session(&conn, id3, 200.0, Some(6)).unwrap();
+
+        let apps = query_app_usage(&conn, "2026-06-19", 10).unwrap();
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0].process.as_deref(), Some("code.exe")); // busiest first
+        assert!((apps[0].active_seconds - 200.0).abs() < 1e-9);
+        assert_eq!(apps[1].process.as_deref(), Some("chrome.exe"));
+        assert!((apps[1].active_seconds - 150.0).abs() < 1e-9); // 100 + 50
+        assert_eq!(apps[1].sessions, 2);
+
+        let states = query_state_breakdown(&conn, "2026-06-19").unwrap();
+        let active = states.iter().find(|s| s.state == "active").unwrap().active_seconds;
+        let reading = states.iter().find(|s| s.state == "reading").unwrap().active_seconds;
+        assert!((active - 300.0).abs() < 1e-9); // 100 + 200
+        assert!((reading - 50.0).abs() < 1e-9);
+
+        assert!(query_app_usage(&conn, "2026-06-20", 10).unwrap().is_empty(), "since filter excludes earlier days");
         drop(conn);
         cleanup(&path);
     }
