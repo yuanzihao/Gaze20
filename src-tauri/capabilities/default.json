@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Minimal frontend permissions for 远眺 Gaze20. App commands stay in Rust; WebViews only need to listen for sync events.",
   "windows": ["main", "reminder-overlay-*"],
-  "permissions": ["core:event:allow-listen"]
+  "permissions": ["core:event:allow-listen", "dialog:allow-save", "dialog:allow-open"]
 }

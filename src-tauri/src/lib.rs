@@ -418,6 +418,33 @@ fn db_import(db: State<db::Database>, json: String) -> Result<db::ImportSummary,
     db::import_json(&mut conn, &json)
 }
 
+/// Write the full export JSON to `path` (chosen via the frontend save dialog). The
+/// blob-download trick does not work in WebView2, so the file write happens in Rust.
+#[tauri::command]
+fn db_export_to_file(db: State<db::Database>, path: String) -> Result<(), String> {
+    let json = {
+        let conn = db.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
+        db::export_json(&conn)?
+    };
+    fs::write(&path, json).map_err(|e| format!("write export file: {e}"))
+}
+
+/// Read a previously-exported JSON from `path` (chosen via the open dialog) and merge
+/// it (idempotent, dedup) into the database.
+#[tauri::command]
+fn db_import_from_file(db: State<db::Database>, path: String) -> Result<db::ImportSummary, String> {
+    let json = fs::read_to_string(&path).map_err(|e| format!("read import file: {e}"))?;
+    let mut conn = db.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
+    db::import_json(&mut conn, &json)
+}
+
+/// Write text to a user-chosen path (selected via the save dialog). Used by the
+/// symptom-only export, which can't rely on blob downloads in WebView2.
+#[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<(), String> {
+    fs::write(&path, content).map_err(|e| format!("write file: {e}"))
+}
+
 /// Check the configured update endpoint. Returns the new version string if one is
 /// available, `None` if up to date. Errors (e.g. "updater not configured") are
 /// surfaced so the UI can say so — see doc/RELEASE.md to activate updates.
@@ -1468,6 +1495,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             log::info!("Gaze20 v{} starting", env!("CARGO_PKG_VERSION"));
@@ -1631,6 +1659,9 @@ pub fn run() {
             db_state_breakdown,
             db_export,
             db_import,
+            db_export_to_file,
+            db_import_from_file,
+            write_text_file,
             check_for_update,
             engine_get_state,
             engine_set_running,

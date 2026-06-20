@@ -36,6 +36,7 @@ import React, {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { save, open } from "@tauri-apps/plugin-dialog";
 import {
   clamp,
   dbToLog,
@@ -1464,13 +1465,18 @@ function Symptoms(props: {
     setScores(emptySymptomScores());
   }
 
-  function exportSymptoms() {
-    const blob = new Blob([JSON.stringify(records, null, 2)], { type: "application/json" });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = `gaze20-symptoms-${todayKey()}.json`;
-    link.click();
-    URL.revokeObjectURL(link.href);
+  async function exportSymptoms() {
+    try {
+      const path = await save({
+        title: "导出症状记录",
+        defaultPath: `gaze20-symptoms-${todayKey()}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }]
+      });
+      if (!path) return;
+      await invoke("write_text_file", { path, content: JSON.stringify(records, null, 2) });
+    } catch {
+      /* user cancelled or write failed; nothing to surface here */
+    }
   }
 
   const symList: Array<{ key: SymptomKind; label: string; emoji: string }> = [
@@ -1708,43 +1714,38 @@ function Settings(props: {
   }
   const [dataMsg, setDataMsg] = useState<string | null>(null);
   async function exportAll() {
-    const json = await safeInvoke<string>("db_export");
-    if (!json) {
+    // WebView2 doesn't trigger blob-anchor downloads, so use a native save dialog and
+    // let Rust write the file to the chosen path.
+    try {
+      const path = await save({
+        title: "导出 Gaze20 数据备份",
+        defaultPath: `gaze20-backup-${todayKey()}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }]
+      });
+      if (!path) return; // user cancelled
+      await invoke("db_export_to_file", { path });
+      setDataMsg(`已导出到 ${path}`);
+    } catch {
       setDataMsg("导出失败");
-      return;
     }
-    const blob = new Blob([json], { type: "application/json" });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = `gaze20-backup-${todayKey()}.json`;
-    link.click();
-    URL.revokeObjectURL(link.href);
-    setDataMsg("已导出全部数据");
   }
-  function pickImport() {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "application/json,.json";
-    input.onchange = async () => {
-      const file = input.files?.[0];
-      if (!file) return;
+  async function pickImport() {
+    try {
+      const path = await open({
+        title: "导入 Gaze20 数据备份",
+        multiple: false,
+        filters: [{ name: "JSON", extensions: ["json"] }]
+      });
+      if (!path || typeof path !== "string") return; // cancelled
       setDataMsg("导入中…");
-      try {
-        const text = await file.text();
-        const sum = await safeInvoke<{ daily: number; hourly: number; reminders: number; symptoms: number; activity: number }>(
-          "db_import",
-          { json: text }
-        );
-        setDataMsg(
-          sum
-            ? `已导入新增：日 ${sum.daily} · 时段 ${sum.hourly} · 提醒 ${sum.reminders} · 症状 ${sum.symptoms} · 活动 ${sum.activity}`
-            : "导入失败：文件格式不对"
-        );
-      } catch {
-        setDataMsg("导入失败：无法读取文件");
-      }
-    };
-    input.click();
+      const sum = await invoke<{ daily: number; hourly: number; reminders: number; symptoms: number; activity: number }>(
+        "db_import_from_file",
+        { path }
+      );
+      setDataMsg(`已导入新增：日 ${sum.daily} · 时段 ${sum.hourly} · 提醒 ${sum.reminders} · 症状 ${sum.symptoms} · 活动 ${sum.activity}`);
+    } catch {
+      setDataMsg("导入失败：文件无法读取或格式不对");
+    }
   }
   const [retention, setRetention] = useState<number | null>(null);
   useEffect(() => {
@@ -1844,6 +1845,10 @@ function Settings(props: {
             {checking ? "检查中…" : "检查更新"}
           </button>
         </div>
+      </section>
+
+      <section className="settings-card">
+        <SectionTitle title="数据管理" sub="备份迁移与保留天数" />
         <div className="settings-data-row">
           <span className="settings-row-copy">
             数据导出 / 导入

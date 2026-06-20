@@ -25,6 +25,9 @@ tauri-plugin-log = "2"
 # Auto-update plumbing. Inert until the user configures plugins.updater (pubkey +
 # endpoints) — see doc/RELEASE.md.
 tauri-plugin-updater = "2"
+# Native save/open dialogs — WebView2 does not trigger blob-anchor downloads, so the
+# data export/import use real OS file dialogs + Rust-side file IO instead.
+tauri-plugin-dialog = "2"
 # Local data layer. `bundled` compiles SQLite in-tree so there is no system
 # dependency to ship on Windows.
 rusqlite = { version = "0.32", features = ["bundled"] }

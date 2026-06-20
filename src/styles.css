@@ -275,15 +275,21 @@ button {
   gap: 16px;
 }
 
+/* Masonry: cards of very different heights pack tightly into balanced columns
+   instead of leaving ragged whitespace under the shorter cards of a grid row. */
 .settings-grid {
-  align-items: start;
+  display: block;
+  column-count: 2;
+  column-gap: 16px;
 }
 
 .settings-grid > .wide-card,
 .settings-grid > .settings-card,
-.settings-grid > .activity-card {
+.settings-grid > .activity-card,
+.settings-grid > section {
   min-width: 0;
-  overflow: hidden;
+  break-inside: avoid;
+  margin-bottom: 16px;
 }
 
 .overview-shell {
@@ -2773,6 +2779,10 @@ body.overlay-body .overlay-privacy {
   .action-steps,
   .mode-grid {
     grid-template-columns: 1fr;
+  }
+
+  .settings-grid {
+    column-count: 1;
   }
 
   .hero-card,
