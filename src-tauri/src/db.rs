@@ -682,6 +682,18 @@ pub fn insert_symptom(
     Ok(conn.last_insert_rowid())
 }
 
+/// Today's symptom severity 0–1, from the latest self-assessment today (the 5 scores
+/// averaged and normalized to 0–1; 0 if none recorded). Folds into the risk score.
+pub fn today_symptom_severity(conn: &Connection, today: &str) -> f64 {
+    conn.query_row(
+        "SELECT (dry + blur + headache + neck + redness) / 25.0 \
+         FROM symptom_records WHERE date(at) = ?1 ORDER BY at_ms DESC, id DESC LIMIT 1",
+        [today],
+        |r| r.get::<_, f64>(0),
+    )
+    .unwrap_or(0.0)
+}
+
 pub fn recent_symptoms(conn: &Connection, limit: i64) -> Result<Vec<SymptomRow>, String> {
     let mut stmt = conn
         .prepare(

@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 const SECS_PER_MIN: f64 = 60.0;
-pub const RISK_MODEL_VERSION: i64 = 1;
+pub const RISK_MODEL_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,6 +66,7 @@ pub struct RiskComponents {
     pub completion: f64,
     pub gaze: f64,
     pub pressure: f64,
+    pub symptom: f64,
     pub score: i64,
 }
 
@@ -153,6 +154,10 @@ pub struct Engine {
     /// host reads this to bump the per-hour heatmap bucket.
     #[serde(skip)]
     pub last_tick_accumulated: f64,
+    /// Today's symptom severity 0–1 (latest self-assessment, normalized), set by the
+    /// host from the DB. Folds into the risk score (more symptoms → higher risk).
+    #[serde(skip)]
+    pub symptom_severity: f64,
 }
 
 impl Default for Engine {
@@ -182,6 +187,7 @@ impl Default for Engine {
             snooze_until_ms: 0,
             reminding: None,
             last_tick_accumulated: 0.0,
+            symptom_severity: 0.0,
         }
     }
 }
@@ -222,8 +228,10 @@ impl Engine {
         let gaze_target = (self.micro_done as f64 * preset.break_seconds).max(1.0);
         let gaze_risk = (1.0 - clamp(self.distant_gaze / gaze_target, 0.0, 1.0)) * 10.0;
         let pressure_risk = clamp(micro_active / (preset.micro_minutes * SECS_PER_MIN), 0.0, 1.0) * 20.0;
+        // Reported symptoms (red eyes, dryness, blur, …) push the risk up by up to 20.
+        let symptom_risk = clamp(self.symptom_severity, 0.0, 1.0) * 20.0;
         let score = clamp(
-            continuous_risk + total_risk + completion_risk + gaze_risk + pressure_risk,
+            continuous_risk + total_risk + completion_risk + gaze_risk + pressure_risk + symptom_risk,
             0.0,
             100.0,
         )
@@ -235,6 +243,7 @@ impl Engine {
             completion: completion_risk,
             gaze: gaze_risk,
             pressure: pressure_risk,
+            symptom: symptom_risk,
             score,
         }
     }
@@ -574,5 +583,19 @@ mod tests {
         // Fields absent from the JSON take their Default values.
         assert_eq!(e.reading_grace_minutes, Engine::default().reading_grace_minutes);
         assert_eq!(e.micro_done, 0);
+    }
+
+    #[test]
+    fn symptoms_raise_the_risk_score() {
+        let mut e = balanced();
+        e.screen_seconds = 2.0 * 3600.0;
+        let base = e.compute_risk(0.0, 0.0);
+        e.symptom_severity = 1.0; // worst reported symptoms
+        let with_symptoms = e.compute_risk(0.0, 0.0);
+        assert!(with_symptoms > base, "reported symptoms increase risk");
+        assert!((0..=100).contains(&with_symptoms));
+        let c = e.compute_risk_components(0.0, 0.0);
+        assert!(c.symptom > 0.0, "components expose the symptom contribution");
+        assert_eq!(c.model_version, RISK_MODEL_VERSION);
     }
 }

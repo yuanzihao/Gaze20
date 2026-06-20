@@ -1003,7 +1003,7 @@ fn symptom_prompt_due<R: Runtime>(
     if !enabled {
         return false;
     }
-    let target = db::get_setting(&conn, "symptom_reminder_time").unwrap_or_else(|| "18:00".into());
+    let target = db::get_setting(&conn, "symptom_reminder_time").unwrap_or_else(|| "17:00".into());
     let now_hm: String = conn
         .query_row("SELECT strftime('%H:%M','now','localtime')", [], |r| r.get(0))
         .unwrap_or_default();
@@ -1081,6 +1081,22 @@ fn spawn_engine_loop<R: Runtime + 'static>(app: AppHandle<R>) {
                 .try_state::<db::Database>()
                 .and_then(|db| db.conn.lock().ok().map(|c| db::today_local(&c)))
                 .unwrap_or_default();
+
+            // Feed the engine today's symptom severity (latest self-assessment, 0–1) so
+            // the risk score reflects reported symptoms; refreshed every ~10s.
+            if (ticks == 1 || ticks.is_multiple_of(10)) && !today.is_empty() {
+                let sev = app
+                    .try_state::<db::Database>()
+                    .and_then(|db| db.conn.lock().ok().map(|c| db::today_symptom_severity(&c, &today)))
+                    .unwrap_or(0.0);
+                if let Some(eh) = app.try_state::<EngineHandle>() {
+                    let mut e = eh.engine.lock().unwrap_or_else(|p| p.into_inner());
+                    if (e.symptom_severity - sev).abs() > 1e-9 {
+                        e.symptom_severity = sev;
+                        e.risk = e.compute_risk(e.continuous, e.micro_active);
+                    }
+                }
+            }
 
             let (decision, live, finished, accumulated) = match app.try_state::<EngineHandle>() {
                 Some(eh) => {
@@ -1229,6 +1245,7 @@ fn spawn_engine_loop<R: Runtime + 'static>(app: AppHandle<R>) {
             // Daily symptom self-assessment prompt at the user's chosen time (checked
             // every ~15s; fires at most once per day).
             if ticks.is_multiple_of(15)
+                && !snap.should_defer
                 && symptom_prompt_due(&app, &today, &mut last_symptom_prompt_date)
             {
                 fire_symptom_prompt(&app);
@@ -1645,7 +1662,7 @@ pub fn run() {
                         // Configurable retention (default 90d); applied at startup.
                         let retention = db::get_setting(&conn, "retention_days")
                             .and_then(|s| s.parse::<i64>().ok())
-                            .unwrap_or(90)
+                            .unwrap_or(365)
                             .clamp(30, 3650);
                         let _ = db::close_stale_activity_sessions(&conn);
                         let _ = db::prune_old(&conn, retention);

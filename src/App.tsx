@@ -1124,19 +1124,19 @@ function TrendStatsPage(props: { data: PersistedData; onExport: () => void }) {
   });
 
   // Symptom trend: per-day averages of each dimension over the day axis.
-  const syColors = ["#2caa7e", "#5b8def", "#eaa13a", "#c07ef0", "#e26d6d"];
-  const syLabels = ["干涩", "模糊", "头痛", "颈肩", "红血丝"];
+  const syColors = ["#e26d6d", "#2caa7e", "#5b8def", "#eaa13a", "#c07ef0"];
+  const syLabels = ["红血丝", "干涩", "模糊", "头痛", "颈肩"];
   const syData = useMemo(() => {
     type Vec5 = [number, number, number, number, number];
     const byDay = new Map<string, { v: Vec5; n: number }>();
     for (const r of symptoms) {
       const key = (r.at || "").slice(0, 10);
       const e = byDay.get(key) ?? { v: [0, 0, 0, 0, 0] as Vec5, n: 0 };
-      e.v[0] += r.scores.dry;
-      e.v[1] += r.scores.blur;
-      e.v[2] += r.scores.headache;
-      e.v[3] += r.scores.neck;
-      e.v[4] += r.scores.redness;
+      e.v[0] += r.scores.redness;
+      e.v[1] += r.scores.dry;
+      e.v[2] += r.scores.blur;
+      e.v[3] += r.scores.headache;
+      e.v[4] += r.scores.neck;
       e.n += 1;
       byDay.set(key, e);
     }
@@ -1419,11 +1419,11 @@ function TrendStatsPage(props: { data: PersistedData; onExport: () => void }) {
 }
 
 const symptomMeta: Array<{ key: SymptomKind; label: string; hint: string }> = [
+  { key: "redness", label: "眼睛红血丝", hint: "眼白发红、布满红血丝（用眼过度最常见、最重要）" },
   { key: "dry", label: "眼干 / 异物感", hint: "眼睛发干、刺痛、异物感" },
   { key: "blur", label: "视物模糊", hint: "看字发虚、聚焦变慢" },
   { key: "headache", label: "头痛 / 眼胀", hint: "额头、眼眶或太阳穴不适" },
-  { key: "neck", label: "颈肩酸痛", hint: "脖子、肩背紧张酸痛" },
-  { key: "redness", label: "眼睛红血丝", hint: "眼白发红、布满红血丝（用眼过度最常见）" }
+  { key: "neck", label: "颈肩酸痛", hint: "脖子、肩背紧张酸痛" }
 ];
 
 const emptySymptomScores = (): Record<SymptomKind, number> => ({
@@ -1480,20 +1480,27 @@ function Symptoms(props: {
   }
 
   const symList: Array<{ key: SymptomKind; label: string; emoji: string }> = [
+    { key: "redness", label: "眼睛红血丝", emoji: "🩸" },
     { key: "dry", label: "眼睛干涩", emoji: "👁" },
     { key: "blur", label: "视物模糊", emoji: "🌫" },
     { key: "headache", label: "头痛不适", emoji: "🤕" },
-    { key: "neck", label: "颈肩酸痛", emoji: "💆" },
-    { key: "redness", label: "眼睛红血丝", emoji: "🩸" }
+    { key: "neck", label: "颈肩酸痛", emoji: "💆" }
   ];
   const symColors: Record<SymptomKind, string> = { dry: "#2caa7e", blur: "#5b8def", headache: "#eaa13a", neck: "#c07ef0", redness: "#e26d6d" };
   const symTrack: Record<SymptomKind, string> = { dry: "#e6f6ee", blur: "#e8f0ff", headache: "#fff1de", neck: "#f3e8ff", redness: "#fdeaea" };
-  const recent = records.slice(0, 6);
-  const dateLabel = (iso: string) => {
-    const d = iso.slice(0, 10);
-    if (d === todayKey()) return "今日";
-    if (d === new Date(Date.now() - 86400000).toISOString().slice(0, 10)) return "昨日";
-    return `${iso.slice(5, 7)}/${iso.slice(8, 10)}`;
+  const recent = records.slice(0, 8);
+  // Day + time from the reliable UTC epoch (a day can hold several records, e.g.
+  // morning and evening), rendered in local time.
+  const whenLabel = (record: SymptomRecord) => {
+    const d = record.atMs ? new Date(record.atMs) : new Date(record.at);
+    const p = (n: number) => String(n).padStart(2, "0");
+    const dayIso = localIsoDate(d);
+    const time = `${p(d.getHours())}:${p(d.getMinutes())}`;
+    let day: string;
+    if (dayIso === todayKey()) day = "今日";
+    else if (dayIso === localIsoDate(new Date(Date.now() - 86400000))) day = "昨日";
+    else day = `${p(d.getMonth() + 1)}/${p(d.getDate())}`;
+    return { day, time };
   };
 
   return (
@@ -1566,7 +1573,10 @@ function Symptoms(props: {
           )}
           {recent.map((record) => (
             <div key={record.id} style={{ display: "flex", alignItems: "center", gap: 14, padding: "13px 4px", borderBottom: "1px solid #f1f5f3" }}>
-              <span style={{ fontFamily: "'Manrope'", fontWeight: 700, color: "#1d3a32", fontSize: 14, minWidth: 38 }}>{dateLabel(record.at)}</span>
+              <span style={{ minWidth: 52, display: "flex", flexDirection: "column", lineHeight: 1.25 }}>
+                <span style={{ fontFamily: "'Manrope'", fontWeight: 700, color: "#1d3a32", fontSize: 14 }}>{whenLabel(record).day}</span>
+                <span style={{ fontFamily: "'Manrope'", fontWeight: 600, color: "#9aada5", fontSize: 11.5 }}>{whenLabel(record).time}</span>
+              </span>
               <div style={{ display: "flex", flex: 1, gap: 6 }}>
                 {symList.map((item) => (
                   <div key={item.key} style={{ flex: 1, height: 28, background: symTrack[item.key], borderRadius: 7, position: "relative", overflow: "hidden" }}>
@@ -1749,11 +1759,11 @@ function Settings(props: {
   }
   const [retention, setRetention] = useState<number | null>(null);
   const [sympOn, setSympOn] = useState(true);
-  const [sympTime, setSympTime] = useState("18:00");
+  const [sympTime, setSympTime] = useState("17:00");
   useEffect(() => {
     safeInvoke<Record<string, string>>("db_get_settings").then((s) => {
-      const v = parseInt(s?.["retention_days"] ?? "90", 10);
-      setRetention(Number.isFinite(v) ? v : 90);
+      const v = parseInt(s?.["retention_days"] ?? "365", 10);
+      setRetention(Number.isFinite(v) ? v : 365);
       const en = s?.["symptom_reminder_enabled"];
       setSympOn(en !== "0" && en !== "false");
       const t = s?.["symptom_reminder_time"];
@@ -1882,7 +1892,7 @@ function Settings(props: {
           </span>
           <div className="retention-options">
             {[30, 90, 180, 365].map((d) => {
-              const on = (retention ?? 90) === d;
+              const on = (retention ?? 365) === d;
               return (
                 <button
                   className={on ? "settings-pill-button active" : "settings-pill-button"}
