@@ -102,6 +102,14 @@
   .actions .primary:hover { filter: brightness(1.06); }
   .actions .ghost { background: rgba(255,255,255,.75); color: #41584f; border: 1px solid #dde7e3; }
   .actions .ghost:hover { background: #fff; }
+
+  /* Daily symptom self-assessment mode (kind === "symptom"). */
+  .syRows { width: 100%; margin-top: 14px; display: flex; flex-direction: column; gap: 11px; }
+  .syRow { display: flex; align-items: center; gap: 10px; }
+  .syRow .lab { flex: 1; font-size: 13.5px; font-weight: 700; color: #41584f; }
+  .syRow .dots { display: flex; gap: 6px; }
+  .syRow .dot { width: 19px; height: 19px; border-radius: 50%; border: 1.5px solid #cfe2da; background: #fff; cursor: pointer; transition: background .12s, border-color .12s; }
+  .symptom .actions { margin-top: 20px; }
 </style>
 </head>
 <body>
@@ -163,13 +171,21 @@
       <button class="ghost" id="postpone">延后 5 分钟</button>
       <button class="ghost" id="skip">跳过</button>
     </div>
+
+    <div class="symptom" id="symptomBox" style="display:none; width:100%;">
+      <div class="syRows" id="syRows"></div>
+      <div class="actions">
+        <button class="primary" id="sysubmit">提交</button>
+        <button class="ghost" id="sylater">稍后</button>
+      </div>
+    </div>
   </div>
 
   <script>
   (function () {
     var cfg = window.__GAZE20_OVERLAY__ || {};
     var label = String(cfg.label || "");
-    var kind = cfg.kind === "deep" ? "deep" : "micro";
+    var kind = cfg.kind === "deep" ? "deep" : (cfg.kind === "symptom" ? "symptom" : "micro");
     var total = Number(cfg.seconds);
     if (!isFinite(total) || total <= 0) total = kind === "micro" ? 20 : 180;
     total = Math.max(5, Math.min(1800, total));
@@ -181,6 +197,58 @@
     function invoke(c, a) { try { if (tauri && tauri.core) return tauri.core.invoke(c, a || {}); } catch (e) {} }
     function listen(e, cb) { try { if (tauri && tauri.event) return tauri.event.listen(e, cb); } catch (e2) {} }
     function fmt(s) { var m = Math.floor(s / 60), x = s % 60; return m > 0 ? (m + ":" + String(x).padStart(2, "0")) : String(s); }
+    function revealNow() {
+      var r = label ? invoke("overlay_ready", { label: label }) : null;
+      function go() { document.body.classList.add("ready"); }
+      if (r && typeof r.then === "function") r.then(go).catch(go); else go();
+    }
+
+    // Daily symptom self-assessment: repurpose the card for 5 severity sliders.
+    if (kind === "symptom") {
+      document.querySelector(".orb").style.display = "none";
+      document.getElementById("focus").style.display = "none";
+      document.getElementById("pills").style.display = "none";
+      document.querySelector(".card > .actions").style.display = "none";
+      document.getElementById("title").textContent = "记录今天的眼睛症状";
+      document.getElementById("sub").textContent = "给今天每项症状打个分（0 无 — 5 重）";
+      var items = [["dry", "眼睛干涩"], ["blur", "视物模糊"], ["headache", "头痛不适"], ["neck", "颈肩酸痛"], ["redness", "眼睛红血丝"]];
+      var values = { dry: 0, blur: 0, headache: 0, neck: 0, redness: 0 };
+      var rowsBox = document.getElementById("syRows");
+      items.forEach(function (it) {
+        var key = it[0];
+        var row = document.createElement("div"); row.className = "syRow";
+        var lab = document.createElement("span"); lab.className = "lab"; lab.textContent = it[1];
+        var dots = document.createElement("div"); dots.className = "dots";
+        var dotEls = [];
+        function paint() {
+          var v = values[key];
+          var color = v >= 5 ? "#e26d6d" : v >= 3 ? "#eaa13a" : "#2c8e76";
+          dotEls.forEach(function (d, idx) {
+            var on = idx + 1 <= v;
+            d.style.background = on ? color : "#fff";
+            d.style.borderColor = on ? color : "#cfe2da";
+          });
+        }
+        for (var i = 1; i <= 5; i++) {
+          (function (i) {
+            var d = document.createElement("span"); d.className = "dot";
+            d.onclick = function () { values[key] = values[key] === i ? 0 : i; paint(); };
+            dots.appendChild(d); dotEls.push(d);
+          })(i);
+        }
+        paint();
+        row.appendChild(lab); row.appendChild(dots);
+        rowsBox.appendChild(row);
+      });
+      document.getElementById("symptomBox").style.display = "block";
+      var sysent = false;
+      document.getElementById("sysubmit").onclick = function () { if (sysent) return; sysent = true; invoke("submit_symptom", values); };
+      function syLater() { if (sysent) return; sysent = true; invoke("overlay_action", { action: "skip" }); }
+      document.getElementById("sylater").onclick = syLater;
+      document.getElementById("close").onclick = syLater;
+      requestAnimationFrame(function () { requestAnimationFrame(revealNow); });
+      return;
+    }
 
     var elCount = document.getElementById("count"),
         elUnit = document.getElementById("unit"),

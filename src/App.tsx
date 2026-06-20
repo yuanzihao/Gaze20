@@ -1748,16 +1748,30 @@ function Settings(props: {
     }
   }
   const [retention, setRetention] = useState<number | null>(null);
+  const [sympOn, setSympOn] = useState(true);
+  const [sympTime, setSympTime] = useState("18:00");
   useEffect(() => {
     safeInvoke<Record<string, string>>("db_get_settings").then((s) => {
       const v = parseInt(s?.["retention_days"] ?? "90", 10);
       setRetention(Number.isFinite(v) ? v : 90);
+      const en = s?.["symptom_reminder_enabled"];
+      setSympOn(en !== "0" && en !== "false");
+      const t = s?.["symptom_reminder_time"];
+      if (t && /^\d{2}:\d{2}$/.test(t)) setSympTime(t);
     });
   }, []);
   function setRetentionDays(v: number) {
     setRetention(v);
     safeInvoke("db_set_setting", { key: "retention_days", value: String(v) });
     setDataMsg(`明细数据保留 ${v} 天（重启后生效）`);
+  }
+  function setSymptomOn(on: boolean) {
+    setSympOn(on);
+    safeInvoke("db_set_setting", { key: "symptom_reminder_enabled", value: on ? "1" : "0" });
+  }
+  function setSymptomTime(t: string) {
+    setSympTime(t);
+    if (/^\d{2}:\d{2}$/.test(t)) safeInvoke("db_set_setting", { key: "symptom_reminder_time", value: t });
   }
   return (
     <div className="settings-grid">
@@ -1880,6 +1894,24 @@ function Settings(props: {
               );
             })}
           </div>
+        </div>
+      </section>
+
+      <section className="settings-card">
+        <SectionTitle title="症状自评提醒" sub="每天定时弹窗，提醒记录当天眼睛状态" />
+        <Toggle label="开启每日提醒" checked={sympOn} onChange={setSymptomOn} />
+        <div className="slider-row" style={{ gridTemplateColumns: "1fr auto", marginTop: 14, alignItems: "center" }}>
+          <span style={{ fontWeight: 800 }}>
+            提醒时间
+            <span style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#6f857c", marginTop: 4 }}>建议设在下班前几分钟（如 17:50）；当天已记录则不再提醒。</span>
+          </span>
+          <input
+            type="time"
+            value={sympTime}
+            disabled={!sympOn}
+            onChange={(e) => setSymptomTime(e.target.value)}
+            style={{ fontFamily: "'Manrope'", fontSize: 15, fontWeight: 700, color: "#1f7a64", background: "#eef6f2", border: "none", borderRadius: 10, padding: "8px 12px", opacity: sympOn ? 1 : 0.5 }}
+          />
         </div>
       </section>
 

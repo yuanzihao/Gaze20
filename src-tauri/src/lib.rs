@@ -200,7 +200,11 @@ fn build_overlay_windows<R: Runtime + 'static>(
     score: u32,
     focus_minutes: i64,
 ) -> u32 {
-    let kind_value = if kind == "deep" { "deep" } else { "micro" };
+    let kind_value = match kind {
+        "deep" => "deep",
+        "symptom" => "symptom",
+        _ => "micro",
+    };
     let session = now_ms();
     let monitors = app.available_monitors().unwrap_or_default();
     let mut created = 0u32;
@@ -328,6 +332,46 @@ fn db_add_symptom(
         note.as_deref(),
         screen_seconds,
     )
+}
+
+/// Submit the daily symptom self-assessment from the popup, then close it. Stamped
+/// now (UTC ms), with today's screen seconds for context.
+#[tauri::command]
+fn submit_symptom<R: Runtime>(
+    app: AppHandle<R>,
+    dry: i64,
+    blur: i64,
+    headache: i64,
+    neck: i64,
+    redness: i64,
+) -> Result<(), String> {
+    let screen = app
+        .try_state::<EngineHandle>()
+        .map(|eh| {
+            eh.engine
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .screen_seconds
+        })
+        .unwrap_or(0.0);
+    if let Some(db) = app.try_state::<db::Database>() {
+        if let Ok(conn) = db.conn.lock() {
+            let _ = db::insert_symptom(
+                &conn,
+                None,
+                Some(now_ms() as i64),
+                dry,
+                blur,
+                headache,
+                neck,
+                redness,
+                None,
+                screen,
+            );
+        }
+    }
+    close_overlay_windows(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -905,6 +949,79 @@ fn schedule_fire_reminder<R: Runtime + 'static>(
     });
 }
 
+/// Show the daily symptom self-assessment popup (a `symptom`-kind overlay) on every
+/// monitor, falling back to a system notification if no window could be created.
+fn fire_symptom_prompt<R: Runtime + 'static>(app: &AppHandle<R>) {
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        close_overlay_windows(&app2);
+        let shown = build_overlay_windows(&app2, "symptom", 0, 0, 0, 0);
+        if shown == 0 {
+            let _ = app2
+                .notification()
+                .builder()
+                .title("记录今天的眼睛症状")
+                .body("花几秒给今天的眼干、模糊、红血丝等打个分吧。")
+                .show();
+        }
+    });
+}
+
+/// Whether the once-a-day symptom self-assessment popup is due now: enabled, past the
+/// configured local time, and not already recorded today. Updates `last_prompt_date`
+/// so it fires at most once per day. Skipped while a break reminder is on screen.
+fn symptom_prompt_due<R: Runtime>(
+    app: &AppHandle<R>,
+    today: &str,
+    last_prompt_date: &mut String,
+) -> bool {
+    if today.is_empty() || last_prompt_date == today {
+        return false;
+    }
+    if let Some(eh) = app.try_state::<EngineHandle>() {
+        if eh
+            .engine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reminding
+            .is_some()
+        {
+            return false;
+        }
+    }
+    let db = match app.try_state::<db::Database>() {
+        Some(d) => d,
+        None => return false,
+    };
+    let conn = match db.conn.lock() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let enabled = db::get_setting(&conn, "symptom_reminder_enabled")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
+    if !enabled {
+        return false;
+    }
+    let target = db::get_setting(&conn, "symptom_reminder_time").unwrap_or_else(|| "18:00".into());
+    let now_hm: String = conn
+        .query_row("SELECT strftime('%H:%M','now','localtime')", [], |r| r.get(0))
+        .unwrap_or_default();
+    if now_hm.is_empty() || now_hm.as_str() < target.as_str() {
+        return false;
+    }
+    // Past the time: mark prompted for today, and only fire if not already recorded.
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM symptom_records WHERE date(at) = ?1",
+            [today],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    *last_prompt_date = today.to_string();
+    recorded == 0
+}
+
 /// Loop-local state for the raw activity fact layer: the currently-open session plus
 /// how much eye-use has accrued into it since the last flush to the database.
 #[derive(Default)]
@@ -940,6 +1057,7 @@ fn spawn_engine_loop<R: Runtime + 'static>(app: AppHandle<R>) {
         let mut last = std::time::Instant::now();
         let mut ticks: u64 = 0;
         let mut session = ActivityTracker::default();
+        let mut last_symptom_prompt_date = String::new();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             let now = std::time::Instant::now();
@@ -1106,6 +1224,14 @@ fn spawn_engine_loop<R: Runtime + 'static>(app: AppHandle<R>) {
                     persist_engine(&app);
                 }
                 engine::Decision::None => {}
+            }
+
+            // Daily symptom self-assessment prompt at the user's chosen time (checked
+            // every ~15s; fires at most once per day).
+            if ticks.is_multiple_of(15)
+                && symptom_prompt_due(&app, &today, &mut last_symptom_prompt_date)
+            {
+                fire_symptom_prompt(&app);
             }
 
             let _ = app.emit("engine-state", &live);
@@ -1472,7 +1598,8 @@ pub fn run() {
     // piling up tray-only zombie processes. Skipped under the self-test flag so a
     // diagnostic launch is never swallowed by an already-running instance.
     let self_test = std::env::var_os("GAZE20_SELF_TEST_REMINDER").is_some()
-        || std::env::var_os("GAZE20_SELF_TEST_TRAY").is_some();
+        || std::env::var_os("GAZE20_SELF_TEST_TRAY").is_some()
+        || std::env::var_os("GAZE20_SELF_TEST_SYMPTOM").is_some();
     if !self_test {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -1599,6 +1726,14 @@ pub fn run() {
                 });
             }
 
+            if std::env::var_os("GAZE20_SELF_TEST_SYMPTOM").is_some() {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    fire_symptom_prompt(&handle);
+                });
+            }
+
             // Diagnostic: drive the same engine + async overlay path as
             // `engine_rest_now`, without relying on frontend listener timing.
             if std::env::var_os("GAZE20_SELF_TEST_TRAY").is_some() {
@@ -1651,6 +1786,7 @@ pub fn run() {
             db_set_setting,
             db_schema_version,
             db_add_symptom,
+            submit_symptom,
             db_recent_symptoms,
             db_recent_reminders,
             db_daily_stats,
