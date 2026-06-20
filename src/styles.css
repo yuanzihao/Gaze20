@@ -1707,6 +1707,18 @@ button {
   box-shadow: 0 30px 90px -42px rgba(13, 52, 44, 0.75);
 }
 
+.engineering-panel.embedded {
+  width: 100%;
+  position: static;
+  z-index: auto;
+  margin-top: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
 .engineering-head {
   display: flex;
   align-items: flex-start;

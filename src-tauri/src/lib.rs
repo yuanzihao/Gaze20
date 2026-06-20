@@ -113,10 +113,17 @@ fn show_reminder_overlay<R: Runtime + 'static>(
 }
 
 #[tauri::command]
+fn show_symptom_prompt<R: Runtime + 'static>(app: AppHandle<R>) -> Result<(), String> {
+    schedule_fire_symptom_prompt(app);
+    Ok(())
+}
+
+#[tauri::command]
 fn overlay_action<R: Runtime>(
     app: AppHandle<R>,
     action: String,
     elapsed_seconds: Option<f64>,
+    overlay_kind: Option<String>,
 ) -> Result<(), String> {
     close_overlay_windows(&app);
     app.emit(
@@ -124,6 +131,7 @@ fn overlay_action<R: Runtime>(
         OverlayActionPayload {
             action,
             elapsed_seconds,
+            overlay_kind,
         },
     )
         .map_err(|error| error.to_string())
@@ -225,8 +233,9 @@ fn build_overlay_windows<R: Runtime + 'static>(
         let mw_logical = m.size().width as f64 / scale;
         let mh_logical = m.size().height as f64 / scale;
         // Compact card; clamp so it never overflows tiny displays.
+        let target_h: f64 = if kind_value == "symptom" { 520.0 } else { 560.0 };
         let card_w = 420.0_f64.min(mw_logical - 32.0).max(300.0);
-        let card_h = 560.0_f64.min(mh_logical - 40.0).max(380.0);
+        let card_h = target_h.min(mh_logical - 40.0).max(380.0);
         let monitor_x = m.position().x as f64 / scale;
         let monitor_y = m.position().y as f64 / scale;
         let placement = OverlayPlacement {
@@ -371,6 +380,7 @@ fn submit_symptom<R: Runtime>(
         }
     }
     close_overlay_windows(&app);
+    finish_overlay_kind_and_maybe_schedule_symptom(&app, Some(OverlayKind::Symptom));
     Ok(())
 }
 
@@ -508,6 +518,7 @@ struct EngineHandle {
     engine: std::sync::Mutex<engine::Engine>,
     snapshot: std::sync::Mutex<ActivitySnapshot>,
     active_reminder: std::sync::Mutex<Option<ReminderMeta>>,
+    overlay: std::sync::Mutex<OverlayCoordinator>,
 }
 
 #[derive(Clone)]
@@ -525,6 +536,85 @@ struct ReminderMeta {
 struct OverlayActionPayload {
     action: String,
     elapsed_seconds: Option<f64>,
+    overlay_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayKind {
+    Reminder,
+    Symptom,
+}
+
+impl OverlayKind {
+    fn from_payload(value: &str) -> Option<Self> {
+        match value {
+            "micro" | "deep" | "reminder" => Some(Self::Reminder),
+            "symptom" => Some(Self::Symptom),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayDecision {
+    ShowNow,
+    DelaySymptom,
+    ShowPendingSymptom,
+    Nothing,
+}
+
+#[derive(Debug, Default)]
+struct OverlayCoordinator {
+    active: Option<OverlayKind>,
+    pending_symptom: bool,
+}
+
+impl OverlayCoordinator {
+    fn request_reminder(&mut self) -> OverlayDecision {
+        if self.active == Some(OverlayKind::Symptom) {
+            self.pending_symptom = true;
+        }
+        self.active = Some(OverlayKind::Reminder);
+        OverlayDecision::ShowNow
+    }
+
+    fn request_symptom(&mut self) -> OverlayDecision {
+        match self.active {
+            Some(OverlayKind::Reminder) => {
+                self.pending_symptom = true;
+                OverlayDecision::DelaySymptom
+            }
+            Some(OverlayKind::Symptom) => OverlayDecision::Nothing,
+            None => {
+                self.active = Some(OverlayKind::Symptom);
+                OverlayDecision::ShowNow
+            }
+        }
+    }
+
+    fn finish_active(&mut self) -> OverlayDecision {
+        self.active = None;
+        self.release_pending_symptom()
+    }
+
+    fn finish_kind(&mut self, kind: OverlayKind) -> OverlayDecision {
+        if self.active == Some(kind) {
+            self.active = None;
+            self.release_pending_symptom()
+        } else {
+            OverlayDecision::Nothing
+        }
+    }
+
+    fn release_pending_symptom(&mut self) -> OverlayDecision {
+        if self.pending_symptom {
+            self.pending_symptom = false;
+            self.active = Some(OverlayKind::Symptom);
+            OverlayDecision::ShowPendingSymptom
+        } else {
+            OverlayDecision::Nothing
+        }
+    }
 }
 
 fn fallback_snapshot() -> ActivitySnapshot {
@@ -839,12 +929,14 @@ fn parse_overlay_action(payload: &str) -> Option<OverlayActionPayload> {
         return Some(OverlayActionPayload {
             action,
             elapsed_seconds: None,
+            overlay_kind: None,
         });
     }
     let action = payload.trim_matches('"').to_string();
     (!action.is_empty()).then_some(OverlayActionPayload {
         action,
         elapsed_seconds: None,
+        overlay_kind: None,
     })
 }
 
@@ -900,6 +992,11 @@ fn handle_overlay_action<R: Runtime>(app: &AppHandle<R>, payload: &str) {
         );
         persist_engine(app);
     }
+    let overlay_kind = payload
+        .overlay_kind
+        .as_deref()
+        .and_then(OverlayKind::from_payload);
+    finish_overlay_kind_and_maybe_schedule_symptom(app, overlay_kind);
 }
 
 /// Fire the WebView reminder card on every monitor, falling back to a system
@@ -913,6 +1010,9 @@ fn fire_reminder<R: Runtime + 'static>(
     eye_score: u32,
     focus_minutes: i64,
 ) {
+    if request_reminder_overlay(app) != OverlayDecision::ShowNow {
+        return;
+    }
     let app2 = app.clone();
     let kind = (if deep { "deep" } else { "micro" }).to_string();
     let _ = app.run_on_main_thread(move || {
@@ -949,11 +1049,91 @@ fn schedule_fire_reminder<R: Runtime + 'static>(
     });
 }
 
+fn request_reminder_overlay<R: Runtime>(app: &AppHandle<R>) -> OverlayDecision {
+    app.try_state::<EngineHandle>()
+        .map(|eh| {
+            eh.overlay
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .request_reminder()
+        })
+        .unwrap_or(OverlayDecision::ShowNow)
+}
+
+fn request_symptom_overlay<R: Runtime>(app: &AppHandle<R>) -> OverlayDecision {
+    app.try_state::<EngineHandle>()
+        .map(|eh| {
+            eh.overlay
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .request_symptom()
+        })
+        .unwrap_or(OverlayDecision::ShowNow)
+}
+
+fn active_overlay_is_symptom<R: Runtime>(app: &AppHandle<R>) -> bool {
+    app.try_state::<EngineHandle>()
+        .map(|eh| {
+            eh.overlay
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .active
+                == Some(OverlayKind::Symptom)
+        })
+        .unwrap_or(true)
+}
+
+fn finish_overlay_kind_and_maybe_schedule_symptom<R: Runtime + 'static>(
+    app: &AppHandle<R>,
+    kind: Option<OverlayKind>,
+) {
+    let decision = app
+        .try_state::<EngineHandle>()
+        .map(|eh| {
+            let mut overlay = eh.overlay.lock().unwrap_or_else(|p| p.into_inner());
+            match kind {
+                Some(kind) => overlay.finish_kind(kind),
+                None => overlay.finish_active(),
+            }
+        })
+        .unwrap_or(OverlayDecision::Nothing);
+    if decision == OverlayDecision::ShowPendingSymptom {
+        schedule_reserved_symptom_prompt(app.clone());
+    }
+}
+
+fn schedule_fire_symptom_prompt<R: Runtime + 'static>(app: AppHandle<R>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        fire_symptom_prompt(&app);
+    });
+}
+
+fn schedule_reserved_symptom_prompt<R: Runtime + 'static>(app: AppHandle<R>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(220));
+        fire_reserved_symptom_prompt(&app);
+    });
+}
+
 /// Show the daily symptom self-assessment popup (a `symptom`-kind overlay) on every
 /// monitor, falling back to a system notification if no window could be created.
 fn fire_symptom_prompt<R: Runtime + 'static>(app: &AppHandle<R>) {
+    if request_symptom_overlay(app) != OverlayDecision::ShowNow {
+        return;
+    }
+    fire_reserved_symptom_prompt(app);
+}
+
+fn fire_reserved_symptom_prompt<R: Runtime + 'static>(app: &AppHandle<R>) {
+    if !active_overlay_is_symptom(app) {
+        return;
+    }
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
+        if !active_overlay_is_symptom(&app2) {
+            return;
+        }
         close_overlay_windows(&app2);
         let shown = build_overlay_windows(&app2, "symptom", 0, 0, 0, 0);
         if shown == 0 {
@@ -1686,6 +1866,7 @@ pub fn run() {
                 engine: std::sync::Mutex::new(engine_state),
                 snapshot: std::sync::Mutex::new(fallback_snapshot()),
                 active_reminder: std::sync::Mutex::new(None),
+                overlay: std::sync::Mutex::new(OverlayCoordinator::default()),
             });
             spawn_engine_loop(app.handle().clone());
             {
@@ -1795,6 +1976,7 @@ pub fn run() {
             set_autostart,
             get_autostart,
             show_reminder_overlay,
+            show_symptom_prompt,
             overlay_action,
             overlay_start,
             overlay_ready,
@@ -1834,6 +2016,45 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+#[cfg(test)]
+mod overlay_coordinator_tests {
+    use super::*;
+
+    #[test]
+    fn symptom_prompt_waits_until_active_reminder_finishes() {
+        let mut coordinator = OverlayCoordinator::default();
+
+        assert_eq!(coordinator.request_reminder(), OverlayDecision::ShowNow);
+        assert_eq!(coordinator.request_symptom(), OverlayDecision::DelaySymptom);
+        assert_eq!(coordinator.finish_active(), OverlayDecision::ShowPendingSymptom);
+        assert_eq!(coordinator.active, Some(OverlayKind::Symptom));
+    }
+
+    #[test]
+    fn reminder_preempts_active_symptom_and_keeps_it_pending() {
+        let mut coordinator = OverlayCoordinator::default();
+
+        assert_eq!(coordinator.request_symptom(), OverlayDecision::ShowNow);
+        assert_eq!(coordinator.request_reminder(), OverlayDecision::ShowNow);
+        assert_eq!(coordinator.active, Some(OverlayKind::Reminder));
+        assert!(coordinator.pending_symptom);
+    }
+
+    #[test]
+    fn stale_reminder_action_does_not_clear_reserved_symptom() {
+        let mut coordinator = OverlayCoordinator::default();
+
+        assert_eq!(coordinator.request_reminder(), OverlayDecision::ShowNow);
+        assert_eq!(coordinator.request_symptom(), OverlayDecision::DelaySymptom);
+        assert_eq!(
+            coordinator.finish_kind(OverlayKind::Reminder),
+            OverlayDecision::ShowPendingSymptom
+        );
+        assert_eq!(coordinator.finish_kind(OverlayKind::Reminder), OverlayDecision::Nothing);
+        assert_eq!(coordinator.active, Some(OverlayKind::Symptom));
     }
 }
 

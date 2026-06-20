@@ -193,6 +193,7 @@ function MainApp() {
     const toggleEngineering = (event: KeyboardEvent) => {
       if (event.ctrlKey && event.shiftKey && event.code === "KeyE") {
         event.preventDefault();
+        setView("settings");
         setEngineeringOpen((open) => !open);
       }
     };
@@ -276,6 +277,10 @@ function MainApp() {
   function previewReminder(kind: ReminderKind) {
     const seconds = kind === "micro" ? preset.breakSeconds : preset.deepBreakMinutes * 60;
     safeInvoke("show_reminder_overlay", { kind, seconds, imageIndex, score: eyeScore });
+  }
+
+  function previewSymptomPrompt() {
+    safeInvoke("show_symptom_prompt");
   }
 
   function resetToday() {
@@ -437,32 +442,24 @@ function MainApp() {
               onAutoStart={setAutoStart}
               onPreviewMicro={() => previewReminder("micro")}
               onPreviewDeep={() => previewReminder("deep")}
+              onPreviewSymptom={previewSymptomPrompt}
+              onCloseOverlays={closeEngineeringOverlays}
+              onSetEyeScore={setEngineeringEyeScore}
+              onToggleFastMode={(debugFastMode) =>
+                updateData((current) => ({
+                  ...current,
+                  settings: { ...current.settings, debugFastMode }
+                }))
+              }
+              displayCount={displayCount}
+              eyeScore={eyeScore}
+              imageIndex={imageIndex}
+              showEngineeringTools={engineeringOpen}
+              onShowEngineeringToolsChange={setEngineeringOpen}
             />
           )}
         </div>
       </main>
-
-      {engineeringOpen && (
-        <EngineeringPanel
-          data={data}
-          displayCount={displayCount}
-          eyeScore={eyeScore}
-          imageIndex={imageIndex}
-          snapshot={snapshot}
-          onClose={() => setEngineeringOpen(false)}
-          onSetEyeScore={setEngineeringEyeScore}
-          onPreviewMicro={() => previewReminder("micro")}
-          onPreviewDeep={() => previewReminder("deep")}
-          onCloseOverlays={closeEngineeringOverlays}
-          onReset={resetToday}
-          onToggleFastMode={(debugFastMode) =>
-            updateData((current) => ({
-              ...current,
-              settings: { ...current.settings, debugFastMode }
-            }))
-          }
-        />
-      )}
     </div>
   );
 }
@@ -1622,10 +1619,12 @@ function EngineeringPanel(props: {
   eyeScore: number;
   imageIndex: number;
   snapshot: ActivitySnapshot;
+  embedded?: boolean;
   onClose: () => void;
   onSetEyeScore: (score: number) => void;
   onPreviewMicro: () => void;
   onPreviewDeep: () => void;
+  onPreviewSymptom: () => void;
   onCloseOverlays: () => void;
   onReset: () => void;
   onToggleFastMode: (enabled: boolean) => void;
@@ -1643,10 +1642,10 @@ function EngineeringPanel(props: {
   }
 
   return (
-    <aside className="engineering-panel" role="dialog" aria-label="工程模式">
+    <aside className={props.embedded ? "engineering-panel embedded" : "engineering-panel"} role="dialog" aria-label="工程模式">
       <div className="engineering-head">
         <div>
-          <span>Ctrl + Shift + E</span>
+          <span>{props.embedded ? "设置页工程工具" : "Ctrl + Shift + E"}</span>
           <h2>工程模式</h2>
         </div>
         <button onClick={props.onClose} aria-label="关闭工程模式"><X size={20} /></button>
@@ -1687,6 +1686,9 @@ function EngineeringPanel(props: {
         <button onClick={props.onPreviewDeep}>
           <Coffee size={16} /> 弹出深休息
         </button>
+        <button onClick={props.onPreviewSymptom}>
+          <FileText size={16} /> 弹出症状自评
+        </button>
         <button onClick={props.onCloseOverlays}>
           <X size={16} /> 关闭提醒
         </button>
@@ -1707,6 +1709,15 @@ function Settings(props: {
   onAutoStart: (enabled: boolean) => void;
   onPreviewMicro: () => void;
   onPreviewDeep: () => void;
+  onPreviewSymptom: () => void;
+  onCloseOverlays: () => void;
+  onSetEyeScore: (score: number) => void;
+  onToggleFastMode: (enabled: boolean) => void;
+  displayCount: number | null;
+  eyeScore: number;
+  imageIndex: number;
+  showEngineeringTools: boolean;
+  onShowEngineeringToolsChange: (enabled: boolean) => void;
 }) {
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
@@ -1869,6 +1880,33 @@ function Settings(props: {
             {checking ? "检查中…" : "检查更新"}
           </button>
         </div>
+      </section>
+
+      <section className="settings-card span-2">
+        <SectionTitle title="工程模式" sub="默认隐藏；打开后可测试提醒弹窗、症状自评和眼睛分数" />
+        <Toggle
+          label="显示工程工具"
+          checked={props.showEngineeringTools}
+          onChange={props.onShowEngineeringToolsChange}
+        />
+        {props.showEngineeringTools && (
+          <EngineeringPanel
+            embedded
+            data={props.data}
+            displayCount={props.displayCount}
+            eyeScore={props.eyeScore}
+            imageIndex={props.imageIndex}
+            snapshot={props.snapshot}
+            onClose={() => props.onShowEngineeringToolsChange(false)}
+            onSetEyeScore={props.onSetEyeScore}
+            onPreviewMicro={props.onPreviewMicro}
+            onPreviewDeep={props.onPreviewDeep}
+            onPreviewSymptom={props.onPreviewSymptom}
+            onCloseOverlays={props.onCloseOverlays}
+            onReset={props.onReset}
+            onToggleFastMode={props.onToggleFastMode}
+          />
+        )}
       </section>
 
       <section className="settings-card">
