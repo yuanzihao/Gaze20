@@ -1,6 +1,6 @@
 [package]
 name = "gaze20"
-version = "0.2.0"
+version = "0.3.0"
 description = "远眺 Gaze20 desktop eye-care reminder"
 authors = ["远眺 Gaze20"]
 edition = "2021"

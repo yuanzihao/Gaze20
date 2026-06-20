@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.2.0"
+        description: "Release tag, for example v0.3.0"
         required: true
         type: string
 
@@ -35,7 +35,7 @@ jobs:
         run: |
           $tag = "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
           if ($tag -notmatch '^v\d+\.\d+\.\d+') {
-            throw "Release tag must look like v0.2.0. Got: $tag"
+            throw "Release tag must look like v0.3.0. Got: $tag"
           }
           $version = $tag -replace '^v', ''
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append

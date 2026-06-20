@@ -6,9 +6,9 @@
 
 ## 数据层 · 已强化（地基）
 
-数据层已按「专业工具」标准打牢，要点（均带单测，22 个数据库/引擎单测）：
+数据层已按「专业工具」标准打牢，要点（均带单测，26 个数据库/引擎/弹窗调度单测）：
 
-- ✅ **本地 SQLite 系统**：迁移链（现 `SCHEMA_VERSION = 6`）、事实表 + 聚合表分层、迁移前自动备份、损坏自动恢复、保留期裁剪、隐私不存窗口标题。
+- ✅ **本地 SQLite 系统**：迁移链（现 `SCHEMA_VERSION = 7`）、事实表 + 聚合表分层、迁移前自动备份、损坏自动恢复、保留期裁剪、隐私不存窗口标题。
 - ✅ **状态机在 Rust**：重启不丢当天进度。
 - ✅ **P0-1 原始活动事实层（V5）**：`activity_sessions` 真正写入——每段「同进程 + 同活动档位」的连续有效用眼一行（`started_ms/ended_ms` UTC 毫秒、`state` active/reading/meeting、`process`、本地 `date/hour`）。解锁 per-app 分析、用眼构成、回溯重算。
 - ✅ **P0-2 时间戳标准化（V4）**：事实表加 `at_ms`（UTC 毫秒）双写 + 回填；查询/前端按 epoch，跨时区/DST 安全。
@@ -24,8 +24,8 @@
 
 地基已就绪，下列扩展都是「一次小迁移」即可，无需重构：
 
-1. **提醒上下文（触发时的模式）** — `ALTER TABLE reminder_events ADD COLUMN mode TEXT;`（V7），`insert_reminder_event` 增 `mode` 入参（`record_reminder_event` 由引擎当时 `mode.as_str()` 传入），`ReminderEventRow` + SELECT + 导出/导入补 `mode`。用于「分模式完成率」。
-2. **症状可扩展** — `ALTER TABLE symptom_records ADD COLUMN extra TEXT;`（V7，存 JSON）。加新症状种类时写进 `extra`，无需再迁移；导出/导入随 `SymptomRow` 带上即可。比 EAV 简单且可查。
+1. **提醒上下文（触发时的模式）** — `ALTER TABLE reminder_events ADD COLUMN mode TEXT;`（V8），`insert_reminder_event` 增 `mode` 入参（`record_reminder_event` 由引擎当时 `mode.as_str()` 传入），`ReminderEventRow` + SELECT + 导出/导入补 `mode`。用于「分模式完成率」。
+2. **症状可扩展** — `ALTER TABLE symptom_records ADD COLUMN extra TEXT;`（V8，存 JSON）。加新症状种类时写进 `extra`，无需再迁移；导出/导入随 `SymptomRow` 带上即可。比 EAV 简单且可查。
 3. **多档案 / 多用户（profile）** — 真要做就一次做对：给 `daily_stats` / `hourly_stats` 改主键为 `(profile_id, date[, hour])`，其余表加 `profile_id`（默认 `'default'`），所有查询带 `WHERE profile_id = ?`。**不做半吊子预留**（单加一列不改 PK 反而埋坑）。
 
 ---
@@ -62,7 +62,7 @@
 
 - **首次运行引导**：2–3 屏 onboarding（含隐私承诺：仅本地、不传云、不存窗口标题）。
 - **提醒间隔自定义**：现仅保守/平衡/激进三档；允许自定义 micro/deep 分钟数。
-- **症状纳入风险模型**：`engine.rs` 的 `compute_risk` 未含症状项；把近 N 天症状均分纳入。
+- **风险模型校准**：症状自评已纳入 `engine.rs` 的 v2 风险模型；后续需要更多真实使用数据校准权重。
 - **i18n / 无障碍**：全硬编码中文；要出海再抽 `react-i18next` + 补 `aria-*` / 焦点管理。
 - **自动更新的「自动」**：现为手动「检查更新」；可做启动静默检查 + 一键安装（`download_and_install`），见 [`RELEASE.md`](RELEASE.md) §2.4。
 - **代码签名 + 真实更新服务端**：脚手架就绪，缺证书 / 服务器，见 [`RELEASE.md`](RELEASE.md)。

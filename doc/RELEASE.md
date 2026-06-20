@@ -70,9 +70,22 @@ npm run tauri build
 
 ---
 
-## 3. 建议：用 CI 自动出签名版本
+## 3. GitHub Actions 自动发版
 
-目前没有 `.github/`。建议加 GitHub Actions：打 tag 时自动 `cargo test` + 构建 + 签名（证书/私钥放 repo secret）+ 创建 Release + 上传 `latest.json`。这样发版可复现、不手滑。
+仓库已接入两个工作流：
+
+- `.github/workflows/build.yml`：推送 `main` / `develop`、提交 PR 或手动触发时，执行 `tsc`、`cargo test`、`clippy -D warnings` 和 Tauri release 构建，并上传 exe / 安装包产物。
+- `.github/workflows/release.yml`：推送形如 `v0.3.0` 的 tag，或手动输入 tag 后，自动创建 GitHub Release，上传 NSIS 安装包、MSI 安装包和免安装 portable zip。
+
+发布新版时先确保 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 版本一致，然后执行：
+
+```bash
+git tag -a v0.3.0 -m "远眺 Gaze20 v0.3.0"
+git push origin main
+git push origin v0.3.0
+```
+
+后续接入代码签名 / updater 签名时，把证书、私钥和密码放进 GitHub Secrets，再在 release workflow 中增加签名步骤即可。
 
 ---
 
